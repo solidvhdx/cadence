@@ -21,7 +21,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     if (singleInstanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         if (isRestartAfterUpdate) {
             // Wait briefly for the previous process to finish shutting down after self-update
-            for (int attempt = 0; attempt < 25; ++attempt) {
+            for (int attempt = 0; attempt < 50; ++attempt) {
                 CloseHandle(singleInstanceMutex);
                 Sleep(100);
                 singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\CadenceSingleInstanceMutex");

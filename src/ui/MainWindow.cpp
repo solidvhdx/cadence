@@ -129,6 +129,9 @@ void MainWindow::ShowToast(std::wstring text, bool isDanger) {
 }
 
 MainWindow::~MainWindow() {
+    if (m_updateCancelToken) {
+        m_updateCancelToken->store(true, std::memory_order_release);
+    }
     if (m_updateShared) {
         std::scoped_lock lock(m_updateShared->mtx);
         m_updateShared->hwnd = nullptr;
@@ -459,6 +462,7 @@ void MainWindow::ShowFromTray() {
     ShowWindow(m_hwnd, SW_RESTORE);
     SetForegroundWindow(m_hwnd);
     UpdateTelemetryTimer();
+    if (m_updateDownloading) StartAnimTimer();
     RequestRender();
 }
 
@@ -531,6 +535,26 @@ void MainWindow::StepAnimations() {
     if (m_toastMs > 0.0f) {
         m_toastMs = std::max(0.0f, m_toastMs - 16.0f);
         if (m_toastMs > 0.0f) stillMoving = true;
+    }
+
+    if (m_updateDownloading && m_updateShared) {
+        m_updateAnimPhase += 0.022f;
+        if (m_updateAnimPhase >= 1.0f) m_updateAnimPhase -= 1.0f;
+
+        const auto st = static_cast<UpdateStage>(m_updateShared->stage.load(std::memory_order_acquire));
+        const uint64_t dl  = m_updateShared->bytesDownloaded.load(std::memory_order_relaxed);
+        const uint64_t tot = m_updateShared->bytesTotal.load(std::memory_order_relaxed);
+        float targetProg = m_updateProgVisual;
+        if (st == UpdateStage::Installing) {
+            targetProg = 1.0f;
+        } else if (st == UpdateStage::Downloading && tot > 0) {
+            targetProg = std::clamp(static_cast<float>(static_cast<double>(dl) / static_cast<double>(tot)), 0.0f, 1.0f);
+        }
+        m_updateProgVisual += (targetProg - m_updateProgVisual) * 0.25f;
+        if (std::abs(targetProg - m_updateProgVisual) < 0.002f) {
+            m_updateProgVisual = targetProg;
+        }
+        stillMoving = true;
     }
 
     RequestRender();
@@ -612,9 +636,11 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
             ScreenToClient(m_hwnd, &pt);
             const float dipX = PxToDip(pt.x);
             const float dipY = PxToDip(pt.y);
-            // Dynamic titlebar drag zone: everything between the profile pill and the Pin icon
+            // Dynamic titlebar drag zone (full left/middle titlebar when update modal is open)
+            const float dragLeft  = m_updateModalOpen ? 0.0f : (m_profileBtnRight + 4.0f);
+            const float dragRight = m_updateModalOpen ? (m_widthDip - 58.0f) : (m_widthDip - 96.0f);
             if (dipY >= 0.0f && dipY <= ThemeTokens::kTitlebarHeight &&
-                dipX >= (m_profileBtnRight + 4.0f) && dipX <= (m_widthDip - 96.0f)) {
+                dipX >= dragLeft && dipX <= dragRight) {
                 return HTCAPTION;
             }
             return HTCLIENT;
@@ -703,31 +729,34 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_APP_UPDATE_DONE: {
-            bool ok = false;
-            std::filesystem::path dlPath;
+            UpdateOutcome outcome = UpdateOutcome::None;
+            uint64_t doneAttempt  = 0;
             if (m_updateShared) {
                 std::scoped_lock lock(m_updateShared->mtx);
-                ok     = m_updateShared->downloadOk;
-                dlPath = m_updateShared->downloadedPath;
+                outcome     = m_updateShared->outcome;
+                doneAttempt = m_updateShared->outcomeAttemptId;
+            }
+            if (doneAttempt != m_updateAttemptId) {
+                return 0; // Stale result from a previously cancelled attempt
             }
             m_updateDownloading = false;
-            if (ok && !dlPath.empty()) {
-                m_engine.Stop();
-                SaveConfigNow();
-                if (UpdateChecker::ApplyUpdateAndRelaunch(dlPath)) {
-                    DestroyWindow(m_hwnd);
-                    return 0;
-                }
-                // Fallback if current folder is read-only (e.g. Program Files without admin): open release page
-                std::error_code ec;
-                std::filesystem::remove(dlPath, ec);
+            m_updateProgVisual  = 0.0f;
+            if (m_updateShared) {
+                m_updateShared->stage.store(static_cast<uint8_t>(UpdateStage::Idle), std::memory_order_release);
+            }
+
+            if (outcome == UpdateOutcome::Applied) {
+                DestroyWindow(m_hwnd);
+                return 0;
+            }
+            if (outcome == UpdateOutcome::NotWritable) {
                 if (m_availableUpdate && !m_availableUpdate->releaseUrl.empty()) {
                     const std::wstring url = Utf8ToWide(m_availableUpdate->releaseUrl);
                     ShellExecuteW(m_hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 }
                 m_updateModalOpen = false;
                 ShowToast(L"Opened GitHub release (folder not writable)", false);
-            } else {
+            } else if (outcome == UpdateOutcome::Failed) {
                 ShowToast(L"Update download failed", true);
             }
             RequestRender();
@@ -814,10 +843,17 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 1;
 
         case WM_CLOSE:
+            if (m_updateShared &&
+                static_cast<UpdateStage>(m_updateShared->stage.load(std::memory_order_acquire)) == UpdateStage::Installing) {
+                return 0; // Allow the in-flight executable swap & relaunch to complete cleanly
+            }
             DestroyWindow(m_hwnd);
             return 0;
 
         case WM_DESTROY:
+            if (m_updateCancelToken) {
+                m_updateCancelToken->store(true, std::memory_order_release);
+            }
             if (m_updateShared) {
                 std::scoped_lock lock(m_updateShared->mtx);
                 m_updateShared->hwnd = nullptr;
@@ -939,7 +975,7 @@ void MainWindow::RenderTitlebar(float w) {
     if (IsHovered("close")) m_renderer.FillRoundedRect(closeRc, 5.0f, HexColor(0xDC2626, 0.85f));
     m_renderer.DrawCloseIcon((closeRc.left + closeRc.right) * 0.5f, (closeRc.top + closeRc.bottom) * 0.5f,
                              IsHovered("close") ? ThemeTokens::kTextWhite : ThemeTokens::kTextMuted);
-    RegisterHit(closeRc, "close", [this]() { DestroyWindow(m_hwnd); });
+    RegisterHit(closeRc, "close", [this]() { SendMessageW(m_hwnd, WM_CLOSE, 0, 0); });
 }
 
 void MainWindow::RenderModeAndTabs(float w, float& y) {
@@ -1899,8 +1935,17 @@ void MainWindow::RenderUpdateModal(float w, float h) {
     const auto& rel = *m_availableUpdate;
     const D2D1_COLOR_F accent = ActiveAccent();
 
-    // Dimmed backdrop covering entire window
-    m_renderer.FillRect({0.0f, 0.0f, w, h}, HexColor(0x000000, 0.64f));
+    const UpdateStage stage = (m_updateDownloading && m_updateShared)
+        ? static_cast<UpdateStage>(m_updateShared->stage.load(std::memory_order_acquire))
+        : UpdateStage::Idle;
+    const uint64_t dlBytes  = (m_updateDownloading && m_updateShared)
+        ? m_updateShared->bytesDownloaded.load(std::memory_order_relaxed) : 0;
+    const uint64_t totBytes = (m_updateDownloading && m_updateShared)
+        ? m_updateShared->bytesTotal.load(std::memory_order_relaxed) : 0;
+    const bool canCancel = m_updateDownloading && (stage != UpdateStage::Installing);
+
+    // Dimmed backdrop below titlebar so window dragging, minimize & close remain crisp and accessible
+    m_renderer.FillRect({0.0f, ThemeTokens::kTitlebarHeight, w, h}, HexColor(0x000000, 0.64f));
 
     const float cardW = w - 48.0f;
     const float cardH = 216.0f;
@@ -1920,23 +1965,30 @@ void MainWindow::RenderUpdateModal(float w, float h) {
 
     // Header: Cube logo + Title + Close X
     m_renderer.DrawCubeLogo(innerL, card.top + 19.0f, 16.0f, accent);
-    m_renderer.DrawText(L"Update available", {innerL + 24.0f, card.top + 15.0f, innerR - 28.0f, card.top + 39.0f},
+    const std::wstring headerTitle = !m_updateDownloading
+        ? L"Update available"
+        : (stage == UpdateStage::Installing ? L"Installing update" : L"Updating Cadence");
+    m_renderer.DrawText(headerTitle, {innerL + 24.0f, card.top + 15.0f, innerR - 28.0f, card.top + 39.0f},
                         TextStyle::Title, ThemeTokens::kTextPrimary);
 
+    const bool closeEnabled = (!m_updateDownloading || canCancel);
     const D2D1_RECT_F closeRc{innerR - 22.0f, card.top + 15.0f, innerR + 2.0f, card.top + 39.0f};
-    if (!m_updateDownloading && IsHovered("upd_close")) {
+    if (closeEnabled && IsHovered("upd_close")) {
         m_renderer.FillRoundedRect(closeRc, 5.0f, HexColor(0xFFFFFF, 0.06f));
     }
     m_renderer.DrawCloseIcon((closeRc.left + closeRc.right) * 0.5f, (closeRc.top + closeRc.bottom) * 0.5f,
-                             IsHovered("upd_close") ? ThemeTokens::kTextPrimary : ThemeTokens::kTextMuted);
-    if (!m_updateDownloading) {
+                             (closeEnabled && IsHovered("upd_close")) ? ThemeTokens::kTextPrimary : ThemeTokens::kTextMuted);
+    if (closeEnabled) {
         RegisterHit(closeRc, "upd_close", [this]() {
+            if (m_updateDownloading) {
+                CancelUpdateDownload();
+            }
             m_updateModalOpen = false;
             RequestRender();
         }, false, true);
     }
 
-    // Version comparison pill: v1.0.1 -> v1.1.0
+    // Version comparison pill: v1.0.2 -> v1.0.3
     const D2D1_RECT_F verPill{innerL, card.top + 50.0f, innerR, card.top + 78.0f};
     m_renderer.FillRoundedRect(verPill, 7.0f, ThemeTokens::kBgRecessed);
     m_renderer.DrawRoundedRect(verPill, 7.0f, ThemeTokens::kHairline);
@@ -1955,25 +2007,40 @@ void MainWindow::RenderUpdateModal(float w, float h) {
     m_renderer.DrawText(L"GitHub Release", {verPill.right - 102.0f, verPill.top, verPill.right - 12.0f, verPill.bottom},
                         TextStyle::Caption, ThemeTokens::kTextMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-    // Description
-    m_renderer.DrawText(L"A newer version of Cadence is ready.",
-                        {innerL, card.top + 88.0f, innerR, card.top + 106.0f}, TextStyle::Body, ThemeTokens::kTextPrimary);
-    m_renderer.DrawText(m_updateDownloading ? L"Downloading Cadence.exe from GitHub…" : L"Downloads Cadence.exe and restarts automatically.",
-                        {innerL, card.top + 107.0f, innerR, card.top + 123.0f}, TextStyle::Caption, ThemeTokens::kTextMuted);
-
-    // Primary CTA: Update now
-    const D2D1_RECT_F updRc{innerL, card.top + 134.0f, innerR, card.top + 168.0f};
-    const D2D1_COLOR_F ctaBg = m_updateDownloading
-        ? ThemeTokens::kBgElevated
-        : ActiveAccent(IsHovered("upd_now"));
-    m_renderer.FillRoundedRect(updRc, ThemeTokens::kRadiusButton, ctaBg);
-    m_renderer.DrawRoundedRect(updRc, ThemeTokens::kRadiusButton, m_updateDownloading ? accent : HexColor(0xFFFFFF, 0.14f));
-    if (!m_updateDownloading) {
-        m_renderer.DrawLine(updRc.left + 8.0f, updRc.top + 1.0f, updRc.right - 8.0f, updRc.top + 1.0f, HexColor(0xFFFFFF, 0.15f));
+    // Description & live status line
+    std::wstring primaryLine = L"A newer version of Cadence is ready.";
+    std::wstring statusLine  = L"Downloads Cadence.exe and restarts automatically.";
+    if (m_updateDownloading) {
+        if (stage == UpdateStage::Connecting) {
+            primaryLine = L"Connecting to GitHub...";
+            statusLine  = L"Starting secure HTTPS download";
+        } else if (stage == UpdateStage::Downloading) {
+            const uint64_t dlKb = (dlBytes + 512) / 1024;
+            if (totBytes > 0) {
+                const uint64_t totKb = std::max<uint64_t>(1, (totBytes + 512) / 1024);
+                const int pct = std::clamp(static_cast<int>((dlBytes * 100) / totBytes), 0, 100);
+                primaryLine = std::format(L"Downloading Cadence.exe... {}%", pct);
+                statusLine  = std::format(L"{} KB / {} KB", dlKb, totKb);
+            } else {
+                primaryLine = L"Downloading Cadence.exe...";
+                statusLine  = std::format(L"{} KB received", dlKb);
+            }
+        } else if (stage == UpdateStage::Installing) {
+            primaryLine = L"Installing and restarting...";
+            statusLine  = L"Verifying binary and launching new version";
+        }
     }
-    m_renderer.DrawText(m_updateDownloading ? L"Downloading…" : L"Update now",
-                        updRc, TextStyle::BodyMedium, ThemeTokens::kTextWhite, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    m_renderer.DrawText(primaryLine, {innerL, card.top + 88.0f, innerR, card.top + 106.0f}, TextStyle::Body, ThemeTokens::kTextPrimary);
+    m_renderer.DrawText(statusLine,  {innerL, card.top + 107.0f, innerR, card.top + 123.0f}, TextStyle::Caption, ThemeTokens::kTextMuted);
+
+    // Primary slot: CTA button when idle, live animated progress bar when downloading/installing
+    const D2D1_RECT_F updRc{innerL, card.top + 134.0f, innerR, card.top + 168.0f};
     if (!m_updateDownloading) {
+        m_renderer.FillRoundedRect(updRc, ThemeTokens::kRadiusButton, ActiveAccent(IsHovered("upd_now")));
+        m_renderer.DrawRoundedRect(updRc, ThemeTokens::kRadiusButton, HexColor(0xFFFFFF, 0.14f));
+        m_renderer.DrawLine(updRc.left + 8.0f, updRc.top + 1.0f, updRc.right - 8.0f, updRc.top + 1.0f, HexColor(0xFFFFFF, 0.15f));
+        m_renderer.DrawText(L"Update now", updRc, TextStyle::BodyMedium, ThemeTokens::kTextWhite, DWRITE_TEXT_ALIGNMENT_CENTER);
         RegisterHit(updRc, "upd_now", [this]() {
             if (m_updatePreviewOnly) {
                 ShowToast(L"Preview mode — update button works!", false);
@@ -1981,25 +2048,58 @@ void MainWindow::RenderUpdateModal(float w, float h) {
             }
             StartUpdateDownloadAsync();
         }, false, true);
+    } else {
+        m_renderer.FillRoundedRect(updRc, ThemeTokens::kRadiusButton, ThemeTokens::kBgRecessed);
+        m_renderer.DrawRoundedRect(updRc, ThemeTokens::kRadiusButton, ThemeTokens::kHairlineStrong);
+
+        const float trackPad = 12.0f;
+        const float trackH   = 8.0f;
+        const float cy       = (updRc.top + updRc.bottom) * 0.5f;
+        const D2D1_RECT_F trackRc{updRc.left + trackPad, cy - trackH * 0.5f, updRc.right - trackPad, cy + trackH * 0.5f};
+        const float trackW = std::max(1.0f, trackRc.right - trackRc.left);
+        m_renderer.FillRoundedRect(trackRc, 4.0f, HexColor(0x09090D));
+        m_renderer.DrawRoundedRect(trackRc, 4.0f, ThemeTokens::kHairline);
+
+        if (stage == UpdateStage::Downloading && totBytes > 0) {
+            const float fillW = std::clamp(trackW * m_updateProgVisual, m_updateProgVisual > 0.005f ? 8.0f : 0.0f, trackW);
+            if (fillW > 0.5f) {
+                m_renderer.FillRoundedRect({trackRc.left, trackRc.top, trackRc.left + fillW, trackRc.bottom}, 4.0f, accent);
+            }
+        } else if (stage == UpdateStage::Installing) {
+            m_renderer.FillRoundedRect(trackRc, 4.0f, ThemeTokens::kEmerald);
+            // Smooth moving highlight glint while Windows verifies & launches the new exe
+            const float segW   = trackW * 0.28f;
+            const float travel = trackW - segW;
+            const float wave   = 0.5f - 0.5f * std::cos(m_updateAnimPhase * 6.2831853f);
+            const float segL   = trackRc.left + travel * wave;
+            m_renderer.FillRoundedRect({segL, trackRc.top, segL + segW, trackRc.bottom}, 4.0f, HexColor(0xFFFFFF, 0.28f));
+        } else {
+            // Connecting or unknown Content-Length: smooth indeterminate gliding bar
+            const float segW   = trackW * 0.34f;
+            const float travel = trackW - segW;
+            const float wave   = 0.5f - 0.5f * std::cos(m_updateAnimPhase * 6.2831853f);
+            const float segL   = trackRc.left + travel * wave;
+            m_renderer.FillRoundedRect({segL, trackRc.top, segL + segW, trackRc.bottom}, 4.0f, accent);
+        }
     }
 
-    // Secondary row: Later | Ignore updates
-    const float btnGap = 8.0f;
-    const float btnW   = (innerR - innerL - btnGap) * 0.5f;
-    const D2D1_RECT_F laterRc{innerL, card.top + 176.0f, innerL + btnW, card.top + 202.0f};
-    const D2D1_RECT_F ignRc  {laterRc.right + btnGap, card.top + 176.0f, innerR, card.top + 202.0f};
-
-    m_renderer.FillRoundedRect(laterRc, 6.0f, (!m_updateDownloading && IsHovered("upd_later")) ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
-    m_renderer.DrawRoundedRect(laterRc, 6.0f, ThemeTokens::kHairlineStrong);
-    m_renderer.DrawText(L"Later", laterRc, TextStyle::Body, ThemeTokens::kTextPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    m_renderer.FillRoundedRect(ignRc, 6.0f, (!m_updateDownloading && IsHovered("upd_ignore")) ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
-    m_renderer.DrawRoundedRect(ignRc, 6.0f, ThemeTokens::kHairline);
-    m_renderer.DrawText(L"Ignore updates", ignRc, TextStyle::Body,
-                        (!m_updateDownloading && IsHovered("upd_ignore")) ? ThemeTokens::kTextPrimary : ThemeTokens::kTextSecondary,
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-
+    // Secondary row: Later | Ignore updates (idle) OR Cancel (downloading) OR Restarting (installing)
     if (!m_updateDownloading) {
+        const float btnGap = 8.0f;
+        const float btnW   = (innerR - innerL - btnGap) * 0.5f;
+        const D2D1_RECT_F laterRc{innerL, card.top + 176.0f, innerL + btnW, card.top + 202.0f};
+        const D2D1_RECT_F ignRc  {laterRc.right + btnGap, card.top + 176.0f, innerR, card.top + 202.0f};
+
+        m_renderer.FillRoundedRect(laterRc, 6.0f, IsHovered("upd_later") ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
+        m_renderer.DrawRoundedRect(laterRc, 6.0f, ThemeTokens::kHairlineStrong);
+        m_renderer.DrawText(L"Later", laterRc, TextStyle::Body, ThemeTokens::kTextPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        m_renderer.FillRoundedRect(ignRc, 6.0f, IsHovered("upd_ignore") ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
+        m_renderer.DrawRoundedRect(ignRc, 6.0f, ThemeTokens::kHairline);
+        m_renderer.DrawText(L"Ignore updates", ignRc, TextStyle::Body,
+                            IsHovered("upd_ignore") ? ThemeTokens::kTextPrimary : ThemeTokens::kTextSecondary,
+                            DWRITE_TEXT_ALIGNMENT_CENTER);
+
         RegisterHit(laterRc, "upd_later", [this]() {
             m_updateModalOpen = false;
             RequestRender();
@@ -2011,6 +2111,20 @@ void MainWindow::RenderUpdateModal(float w, float h) {
             SaveConfigNow();
             ShowToast(L"Updates ignored (re-enable in Settings)", false);
         }, false, true);
+    } else {
+        const D2D1_RECT_F cancelRc{innerL, card.top + 176.0f, innerR, card.top + 202.0f};
+        if (canCancel) {
+            m_renderer.FillRoundedRect(cancelRc, 6.0f, IsHovered("upd_cancel") ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
+            m_renderer.DrawRoundedRect(cancelRc, 6.0f, ThemeTokens::kHairlineStrong);
+            m_renderer.DrawText(L"Cancel", cancelRc, TextStyle::Body, ThemeTokens::kTextPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+            RegisterHit(cancelRc, "upd_cancel", [this]() {
+                CancelUpdateDownload();
+            }, false, true);
+        } else {
+            m_renderer.FillRoundedRect(cancelRc, 6.0f, ThemeTokens::kBgRecessed);
+            m_renderer.DrawRoundedRect(cancelRc, 6.0f, ThemeTokens::kHairline);
+            m_renderer.DrawText(L"Restarting Cadence...", cancelRc, TextStyle::Body, ThemeTokens::kTextMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
     }
 }
 
@@ -2034,6 +2148,23 @@ void MainWindow::StartUpdateCheckAsync() {
     }).detach();
 }
 
+void MainWindow::CancelUpdateDownload() {
+    if (!m_updateDownloading || !m_updateShared) return;
+    if (static_cast<UpdateStage>(m_updateShared->stage.load(std::memory_order_acquire)) == UpdateStage::Installing) {
+        return; // Cannot cancel once binary swap is in progress
+    }
+    if (m_updateCancelToken) {
+        m_updateCancelToken->store(true, std::memory_order_release);
+        m_updateCancelToken.reset();
+    }
+    ++m_updateAttemptId;
+    m_updateShared->attemptId.store(m_updateAttemptId, std::memory_order_release);
+    m_updateShared->stage.store(static_cast<uint8_t>(UpdateStage::Idle), std::memory_order_release);
+    m_updateDownloading = false;
+    m_updateProgVisual  = 0.0f;
+    ShowToast(L"Update cancelled", false);
+}
+
 void MainWindow::StartUpdateDownloadAsync() {
     if (!m_availableUpdate || m_updateDownloading) return;
 
@@ -2048,26 +2179,76 @@ void MainWindow::StartUpdateDownloadAsync() {
     auto shared = m_updateShared;
     if (!shared) return;
 
-    m_updateDownloading = true;
-    RequestRender();
-
     const std::string dlUrl = m_availableUpdate->downloadUrl;
     std::filesystem::path dest = UpdateChecker::CurrentExePath();
     if (dest.empty()) {
-        m_updateDownloading = false;
         ShowToast(L"Could not locate current executable", true);
         return;
     }
-    dest += L".new";
 
-    std::thread([shared, dlUrl, dest]() {
-        const bool ok = UpdateChecker::DownloadBinary(dlUrl, dest);
+    // Stop clicking & persist config before downloading/applying so the background swap never touches UI state
+    m_engine.Stop();
+    SaveConfigNow();
+
+    const uint64_t attempt = ++m_updateAttemptId;
+    dest += L".new." + std::to_wstring(attempt);
+
+    auto cancelToken = std::make_shared<std::atomic<bool>>(false);
+    m_updateCancelToken = cancelToken;
+
+    shared->attemptId.store(attempt, std::memory_order_release);
+    shared->bytesDownloaded.store(0, std::memory_order_relaxed);
+    shared->bytesTotal.store(0, std::memory_order_relaxed);
+    shared->stage.store(static_cast<uint8_t>(UpdateStage::Connecting), std::memory_order_release);
+
+    m_updateDownloading = true;
+    m_updateProgVisual  = 0.0f;
+    m_updateAnimPhase   = 0.0f;
+    StartAnimTimer();
+    RequestRender();
+
+    std::thread([shared, cancelToken, dlUrl, dest, attempt]() {
+        auto isStaleOrCancelled = [&]() noexcept -> bool {
+            return cancelToken->load(std::memory_order_acquire) ||
+                   shared->attemptId.load(std::memory_order_acquire) != attempt;
+        };
+
+        const bool dlOk = UpdateChecker::DownloadBinary(
+            dlUrl,
+            dest,
+            [shared, attempt](uint64_t dl, uint64_t tot) {
+                if (shared->attemptId.load(std::memory_order_acquire) != attempt) return;
+                shared->bytesDownloaded.store(dl, std::memory_order_relaxed);
+                shared->bytesTotal.store(tot, std::memory_order_relaxed);
+                shared->stage.store(static_cast<uint8_t>(UpdateStage::Downloading), std::memory_order_release);
+            },
+            cancelToken.get());
+
+        UpdateOutcome outcome = UpdateOutcome::Failed;
+        if (isStaleOrCancelled()) {
+            std::error_code ec;
+            std::filesystem::remove(dest, ec);
+            outcome = UpdateOutcome::Cancelled;
+        } else if (dlOk) {
+            shared->stage.store(static_cast<uint8_t>(UpdateStage::Installing), std::memory_order_release);
+            // Run file swap + CreateProcessW OFF the UI thread so Defender/SmartScreen scans never freeze the window!
+            if (UpdateChecker::ApplyUpdateAndRelaunch(dest)) {
+                outcome = UpdateOutcome::Applied;
+            } else {
+                std::error_code ec;
+                std::filesystem::remove(dest, ec);
+                outcome = UpdateOutcome::NotWritable;
+            }
+        }
+
         HWND target = nullptr;
         {
             std::scoped_lock lock(shared->mtx);
-            shared->downloadOk     = ok;
-            shared->downloadedPath = ok ? dest : std::filesystem::path{};
-            target                 = shared->hwnd;
+            if (shared->attemptId.load(std::memory_order_acquire) == attempt) {
+                shared->outcome          = outcome;
+                shared->outcomeAttemptId = attempt;
+                target                   = shared->hwnd;
+            }
         }
         if (target) {
             PostMessageW(target, WM_APP_UPDATE_DONE, 0, 0);
@@ -2123,7 +2304,7 @@ void MainWindow::HandleMouseMove(float dipX, float dipY) {
 
     std::string newHover;
     for (auto it = m_hits.rbegin(); it != m_hits.rend(); ++it) {
-        if (m_updateModalOpen && !it->isModal) continue;
+        if (m_updateModalOpen && !it->isModal && it->id != "min" && it->id != "close") continue;
         if (!m_updateModalOpen && m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
         if (PtInRectF(it->rect, dipX, dipY)) {
             newHover = it->id;
@@ -2139,7 +2320,7 @@ void MainWindow::HandleMouseMove(float dipX, float dipY) {
 void MainWindow::HandleLButtonDown(float dipX, float dipY) {
     bool hitPopover = false;
     for (auto it = m_hits.rbegin(); it != m_hits.rend(); ++it) {
-        if (m_updateModalOpen && !it->isModal) continue;
+        if (m_updateModalOpen && !it->isModal && it->id != "min" && it->id != "close") continue;
         if (!m_updateModalOpen && m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
         if (PtInRectF(it->rect, dipX, dipY)) {
             hitPopover = it->isPopover || it->id == "profile_btn";
@@ -2218,9 +2399,13 @@ void MainWindow::HandleCharInput(wchar_t ch) {
 
 void MainWindow::HandleKeyDown(WPARAM vk) {
     if (m_updateModalOpen) {
-        if (vk == VK_ESCAPE && !m_updateDownloading) {
-            m_updateModalOpen = false;
-            RequestRender();
+        if (vk == VK_ESCAPE) {
+            if (m_updateDownloading) {
+                CancelUpdateDownload();
+            } else {
+                m_updateModalOpen = false;
+                RequestRender();
+            }
         }
         return;
     }

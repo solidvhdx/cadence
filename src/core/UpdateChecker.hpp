@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -41,8 +43,13 @@ public:
     // Queries GitHub Releases API synchronously (intended for background thread). Returns newer release if available.
     [[nodiscard]] static std::optional<ReleaseInfo> CheckForUpdate();
 
-    // Downloads a verified Cadence.exe binary over HTTPS to destPath
-    [[nodiscard]] static bool DownloadBinary(const std::string& url, const std::filesystem::path& destPath);
+    using DownloadProgressCallback = std::function<void(uint64_t downloadedBytes, uint64_t totalBytes)>;
+
+    // Downloads a verified Cadence.exe binary over HTTPS to destPath with optional live progress & cancellation
+    [[nodiscard]] static bool DownloadBinary(const std::string& url,
+                                             const std::filesystem::path& destPath,
+                                             const DownloadProgressCallback& onProgress = nullptr,
+                                             const std::atomic<bool>* cancelFlag = nullptr);
 
     // Validates that a file on disk is a genuine, non-truncated x64 Windows PE executable (not a DLL)
     [[nodiscard]] static bool VerifyPe64Binary(const std::filesystem::path& exePath) noexcept;

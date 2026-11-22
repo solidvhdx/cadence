@@ -122,6 +122,7 @@ private:
     // Auto-Update
     void StartUpdateCheckAsync();
     void StartUpdateDownloadAsync();
+    void CancelUpdateDownload();
 
     // Hit-testing & Input
     void RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover = false, bool isModal = false);
@@ -190,19 +191,44 @@ private:
     std::string          m_hoverId;
     std::vector<HitItem> m_hits;
 
-    // Auto-update state (shared state allows detached check thread to exit safely on quick shutdown)
+    // Auto-update state (shared state allows detached check/download threads to exit safely on quick shutdown)
+    enum class UpdateStage : uint8_t {
+        Idle = 0,
+        Connecting,
+        Downloading,
+        Installing
+    };
+
+    enum class UpdateOutcome : uint8_t {
+        None = 0,
+        Applied,
+        NotWritable,
+        Failed,
+        Cancelled
+    };
+
     struct UpdateShared {
         std::mutex                 mtx;
         HWND                       hwnd = nullptr;
         std::optional<ReleaseInfo> found;
-        bool                       downloadOk = false;
-        std::filesystem::path      downloadedPath;
+
+        std::atomic<uint64_t>      attemptId{0};
+        std::atomic<uint8_t>       stage{0};
+        std::atomic<uint64_t>      bytesDownloaded{0};
+        std::atomic<uint64_t>      bytesTotal{0};
+
+        UpdateOutcome              outcome          = UpdateOutcome::None;
+        uint64_t                   outcomeAttemptId = 0;
     };
-    std::shared_ptr<UpdateShared> m_updateShared;
-    std::optional<ReleaseInfo>    m_availableUpdate;
+    std::shared_ptr<UpdateShared>      m_updateShared;
+    std::shared_ptr<std::atomic<bool>> m_updateCancelToken;
+    std::optional<ReleaseInfo>         m_availableUpdate;
     bool                          m_updateModalOpen   = false;
     bool                          m_updateDownloading = false;
     bool                          m_updatePreviewOnly = false;
+    uint64_t                      m_updateAttemptId   = 0;
+    float                         m_updateProgVisual  = 0.0f;
+    float                         m_updateAnimPhase   = 0.0f;
 
     // Smooth animation states (0 FPS when settled!)
     float        m_modeAnimT   = 0.0f; // 0 = CPS, 1 = KPS

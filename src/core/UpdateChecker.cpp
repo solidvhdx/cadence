@@ -279,8 +279,15 @@ std::optional<ReleaseInfo> UpdateChecker::CheckForUpdate() {
     return info;
 }
 
-bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem::path& destPath) {
-    if (!url.starts_with("https://github.com/solidvhdx/cadence/releases/download/")) {
+bool UpdateChecker::DownloadBinary(const std::string& url,
+                                   const std::filesystem::path& destPath,
+                                   const DownloadProgressCallback& onProgress,
+                                   const std::atomic<bool>* cancelFlag) {
+    auto isCancelled = [&]() noexcept -> bool {
+        return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+    };
+
+    if (isCancelled() || !url.starts_with("https://github.com/solidvhdx/cadence/releases/download/")) {
         return false;
     }
 
@@ -303,19 +310,19 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
     const std::wstring ua = L"Cadence/" + Utf8ToWide(CADENCE_VERSION_STR);
     WinHttpHandle session(WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session) return false;
+    if (!session || isCancelled()) return false;
 
     EnforceModernTls(session.Get());
-    WinHttpSetTimeouts(session.Get(), 5000, 6000, 10000, 30000);
+    WinHttpSetTimeouts(session.Get(), 5000, 6000, 10000, 15000);
 
     WinHttpHandle connect(WinHttpConnect(session.Get(), host.c_str(), uc.nPort ? uc.nPort : INTERNET_DEFAULT_HTTPS_PORT, 0));
-    if (!connect) return false;
+    if (!connect || isCancelled()) return false;
 
     WinHttpHandle request(WinHttpOpenRequest(connect.Get(), L"GET", path.c_str(),
                                              nullptr, WINHTTP_NO_REFERER,
                                              WINHTTP_DEFAULT_ACCEPT_TYPES,
                                              WINHTTP_FLAG_SECURE));
-    if (!request) return false;
+    if (!request || isCancelled()) return false;
 
     // Allow HTTPS -> HTTPS redirects (GitHub redirects release downloads to objects.githubusercontent.com)
     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
@@ -324,9 +331,11 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
     if (!WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
         return false;
     }
+    if (isCancelled()) return false;
     if (!WinHttpReceiveResponse(request.Get(), nullptr)) {
         return false;
     }
+    if (isCancelled()) return false;
 
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
@@ -360,6 +369,11 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
         }
     }
 
+    const uint64_t totalExpected = expectedContentLength.value_or(0);
+    if (onProgress) {
+        onProgress(0, totalExpected);
+    }
+
     auto cleanupFail = [&](std::ofstream& f) -> bool {
         if (f.is_open()) f.close();
         std::error_code ec;
@@ -370,10 +384,13 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
     std::ofstream out(destPath, std::ios::binary | std::ios::trunc);
     if (!out) return false;
 
-    std::array<char, 65536> buf{};
+    std::array<char, 16384> buf{};
     uint64_t totalBytes = 0;
 
     for (;;) {
+        if (isCancelled()) {
+            return cleanupFail(out);
+        }
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(request.Get(), &avail)) {
             return cleanupFail(out); // Mid-stream network error: never accept partial binary!
@@ -382,6 +399,9 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
             break; // Clean EOF
         }
         while (avail > 0) {
+            if (isCancelled()) {
+                return cleanupFail(out);
+            }
             const DWORD toRead = static_cast<DWORD>(std::min<size_t>(avail, buf.size()));
             DWORD read = 0;
             if (!WinHttpReadData(request.Get(), buf.data(), toRead, &read)) {
@@ -399,10 +419,13 @@ bool UpdateChecker::DownloadBinary(const std::string& url, const std::filesystem
                 return cleanupFail(out);
             }
             avail -= read;
+            if (onProgress) {
+                onProgress(totalBytes, totalExpected);
+            }
         }
     }
     out.flush();
-    if (!out.good()) {
+    if (!out.good() || isCancelled()) {
         return cleanupFail(out);
     }
     out.close();
@@ -494,6 +517,20 @@ void UpdateChecker::CleanupOldBinary() noexcept {
 }
 
 bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath) {
+    auto moveWithRetry = [](const std::filesystem::path& from, const std::filesystem::path& to) -> bool {
+        for (int attempt = 0; attempt < 12; ++attempt) {
+            if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                return true;
+            }
+            const DWORD err = GetLastError();
+            if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED) {
+                return false;
+            }
+            Sleep(80);
+        }
+        return false;
+    };
+
     std::error_code ec;
     const auto curExe = CurrentExePath();
     if (curExe.empty() || !std::filesystem::exists(newExePath, ec)) {
@@ -507,13 +544,13 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
     std::filesystem::remove(oldExe, ec);
 
     // Windows allows renaming a currently running executable in-place!
-    if (!MoveFileExW(curExe.c_str(), oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!moveWithRetry(curExe, oldExe)) {
         return false;
     }
 
-    if (!MoveFileExW(newExePath.c_str(), curExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!moveWithRetry(newExePath, curExe)) {
         // Roll back immediately so the user never loses their working binary
-        MoveFileExW(oldExe.c_str(), curExe.c_str(), MOVEFILE_REPLACE_EXISTING);
+        moveWithRetry(oldExe, curExe);
         return false;
     }
 
@@ -522,6 +559,9 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(curExe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        // Roll back if the new binary failed to launch
+        moveWithRetry(curExe, newExePath);
+        moveWithRetry(oldExe, curExe);
         return false;
     }
     CloseHandle(pi.hThread);

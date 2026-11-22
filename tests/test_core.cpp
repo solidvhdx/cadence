@@ -235,7 +235,15 @@ int main() {
         std::error_code rmEc;
         std::filesystem::remove(fakePePath, rmEc);
 
-        std::cout << "[PASS] UpdateChecker SemVer, GitHub Release JSON & PE64 validation\n";
+        // Verify pre-cancelled DownloadBinary aborts immediately without touching disk or network
+        std::atomic<bool> preCancel{true};
+        const auto cancelPath = std::filesystem::temp_directory_path() / L"cadence_unit_test_cancel.exe";
+        CADENCE_ASSERT(!UpdateChecker::DownloadBinary("https://github.com/solidvhdx/cadence/releases/download/v1.0.3/Cadence.exe",
+                                                      cancelPath, nullptr, &preCancel),
+                       "Pre-cancelled DownloadBinary returns false immediately");
+        CADENCE_ASSERT(!std::filesystem::exists(cancelPath), "Cancelled DownloadBinary leaves no file behind");
+
+        std::cout << "[PASS] UpdateChecker SemVer, GitHub Release JSON, PE64 & cancel validation\n";
     }
 
     std::cout << "\nALL TESTS PASSED!\n";
