@@ -1,0 +1,23 @@
+# Auto detect text files and normalize line endings
+* text=auto
+
+# Explicit text files
+*.cpp text
+*.hpp text
+*.h text
+*.c text
+*.txt text
+*.md text
+*.yml text
+*.yaml text
+*.json text
+*.xml text
+*.manifest text
+*.rc text
+
+# Binary files
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
