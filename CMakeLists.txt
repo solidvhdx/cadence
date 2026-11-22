@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Cadence VERSION 1.0.0 LANGUAGES CXX)
+project(Cadence VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +19,10 @@ target_compile_definitions(cadence_compile_options INTERFACE
     NOMINMAX
     WINVER=0x0A00
     _WIN32_WINNT=0x0A00
+    CADENCE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    CADENCE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    CADENCE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    CADENCE_VERSION_STR="${PROJECT_VERSION}"
 )
 target_compile_options(cadence_compile_options INTERFACE
     /W4
@@ -52,6 +56,8 @@ add_library(cadence_core STATIC
     src/core/ConfigManager.cpp
     src/core/ProfileManager.hpp
     src/core/ProfileManager.cpp
+    src/core/UpdateChecker.hpp
+    src/core/UpdateChecker.cpp
     src/core/EngineController.hpp
     src/core/EngineController.cpp
 )
@@ -64,6 +70,7 @@ target_link_libraries(cadence_core PUBLIC
     psapi
     shell32
     advapi32
+    winhttp
 )
 
 # ---------------------------------------------------------------------------

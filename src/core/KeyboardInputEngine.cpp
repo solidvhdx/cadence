@@ -70,19 +70,30 @@ INPUT KeyboardInputEngine::BuildKeyInput(uint16_t vk, bool keyUp, KeyDispatchMet
     return input;
 }
 
+void KeyboardInputEngine::MarkHeld(uint16_t vk, KeyDispatchMethod method) noexcept {
+    const uint64_t bit = 1ULL << (vk & 63);
+    if (method == KeyDispatchMethod::VirtualKey) {
+        m_heldVkMethodBits[vk >> 6].fetch_or(bit, std::memory_order_acq_rel);
+    } else {
+        m_heldVkMethodBits[vk >> 6].fetch_and(~bit, std::memory_order_acq_rel);
+    }
+    m_heldBits[vk >> 6].fetch_or(bit, std::memory_order_acq_rel);
+}
+
+void KeyboardInputEngine::MarkReleased(uint16_t vk) noexcept {
+    const uint64_t bit = 1ULL << (vk & 63);
+    m_heldBits[vk >> 6].fetch_and(~bit, std::memory_order_acq_rel);
+}
+
 bool KeyboardInputEngine::SendKeyDown(uint16_t vk, KeyDispatchMethod method) noexcept {
     if (vk == 0 || vk >= 256) {
         return false;
     }
     INPUT input = BuildKeyInput(vk, false, method);
-
-    MouseInputEngine::IsInjecting().store(true, std::memory_order_release);
-    MouseInputEngine::InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(1, &input, sizeof(INPUT));
-    MouseInputEngine::IsInjecting().store(false, std::memory_order_release);
 
     if (sent == 1) {
-        m_heldBits[vk >> 6].fetch_or(1ULL << (vk & 63), std::memory_order_acq_rel);
+        MarkHeld(vk, method);
         return true;
     }
     return false;
@@ -93,13 +104,9 @@ bool KeyboardInputEngine::SendKeyUp(uint16_t vk, KeyDispatchMethod method) noexc
         return false;
     }
     INPUT input = BuildKeyInput(vk, true, method);
-
-    MouseInputEngine::IsInjecting().store(true, std::memory_order_release);
-    MouseInputEngine::InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(1, &input, sizeof(INPUT));
-    MouseInputEngine::IsInjecting().store(false, std::memory_order_release);
 
-    m_heldBits[vk >> 6].fetch_and(~(1ULL << (vk & 63)), std::memory_order_acq_rel);
+    MarkReleased(vk);
     return sent == 1;
 }
 
@@ -127,14 +134,10 @@ bool KeyboardInputEngine::SendChordDown(uint16_t primaryVk, bool ctrl, bool shif
     vks[count] = primaryVk;
     batch[count++] = BuildKeyInput(primaryVk, false, method);
 
-    MouseInputEngine::IsInjecting().store(true, std::memory_order_release);
-    MouseInputEngine::InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(count, batch, sizeof(INPUT));
-    MouseInputEngine::IsInjecting().store(false, std::memory_order_release);
 
     for (UINT i = 0; i < sent; ++i) {
-        const uint16_t vk = vks[i];
-        m_heldBits[vk >> 6].fetch_or(1ULL << (vk & 63), std::memory_order_acq_rel);
+        MarkHeld(vks[i], method);
     }
     return sent == count;
 }
@@ -165,36 +168,33 @@ bool KeyboardInputEngine::SendChordUp(uint16_t primaryVk, bool ctrl, bool shift,
         batch[count++] = BuildKeyInput(VK_LCONTROL, true, method);
     }
 
-    MouseInputEngine::IsInjecting().store(true, std::memory_order_release);
-    MouseInputEngine::InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(count, batch, sizeof(INPUT));
-    MouseInputEngine::IsInjecting().store(false, std::memory_order_release);
 
     for (UINT i = 0; i < count; ++i) {
-        const uint16_t vk = vks[i];
-        m_heldBits[vk >> 6].fetch_and(~(1ULL << (vk & 63)), std::memory_order_acq_rel);
+        MarkReleased(vks[i]);
     }
     return sent == count;
 }
 
-void KeyboardInputEngine::ReleaseAll(KeyDispatchMethod method) noexcept {
+void KeyboardInputEngine::ReleaseAll() noexcept {
     std::vector<INPUT> inputs;
     for (size_t word = 0; word < 4; ++word) {
-        uint64_t bits = m_heldBits[word].exchange(0, std::memory_order_acq_rel);
+        uint64_t bits       = m_heldBits[word].exchange(0, std::memory_order_acq_rel);
+        const uint64_t vkM  = m_heldVkMethodBits[word].load(std::memory_order_acquire);
         while (bits != 0) {
             unsigned long bitIndex = 0;
             _BitScanForward64(&bitIndex, bits);
             const uint16_t vk = static_cast<uint16_t>((word << 6) + bitIndex);
+            const KeyDispatchMethod method = ((vkM & (1ULL << bitIndex)) != 0)
+                ? KeyDispatchMethod::VirtualKey
+                : KeyDispatchMethod::ScanCode;
             inputs.push_back(BuildKeyInput(vk, true, method));
             bits &= (bits - 1);
         }
     }
 
     if (!inputs.empty()) {
-        MouseInputEngine::IsInjecting().store(true, std::memory_order_release);
-        MouseInputEngine::InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
         SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
-        MouseInputEngine::IsInjecting().store(false, std::memory_order_release);
     }
 }
 

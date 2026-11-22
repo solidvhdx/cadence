@@ -5,12 +5,16 @@
 #include "core/HotkeyManager.hpp"
 #include "core/ProfileManager.hpp"
 #include "core/Types.hpp"
+#include "core/UpdateChecker.hpp"
 #include "ui/D2DRenderer.hpp"
 
 #include <shellapi.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,7 +34,7 @@ public:
     MainWindow(const MainWindow&)            = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
-    bool Create(HINSTANCE hInstance);
+    bool Create(HINSTANCE hInstance, bool previewUpdate = false);
     int  RunMessageLoop();
 
     [[nodiscard]] HWND Handle() const noexcept { return m_hwnd; }
@@ -63,10 +67,13 @@ private:
         bool                  isSlider   = false;
         DragSlider            sliderKind = DragSlider::None;
         bool                  isPopover  = false;
+        bool                  isModal    = false;
     };
 
-    static constexpr UINT WM_APP_STATE_CHANGED = WM_APP + 1;
-    static constexpr UINT WM_APP_TRAY_ICON     = WM_APP + 2;
+    static constexpr UINT WM_APP_STATE_CHANGED    = WM_APP + 1;
+    static constexpr UINT WM_APP_TRAY_ICON        = WM_APP + 2;
+    static constexpr UINT WM_APP_UPDATE_AVAILABLE = WM_APP + 3;
+    static constexpr UINT WM_APP_UPDATE_DONE      = WM_APP + 4;
     static constexpr UINT_PTR kTimerAnim       = 1;
     static constexpr UINT_PTR kTimerTelemetry  = 2;
 
@@ -109,10 +116,15 @@ private:
     void RenderSettingsTab(float w, float& y);
     void RenderFooter(float w, float h);
     void RenderProfilePopover();
+    void RenderUpdateModal(float w, float h);
     void RenderToast(float w, float h);
 
+    // Auto-Update
+    void StartUpdateCheckAsync();
+    void StartUpdateDownloadAsync();
+
     // Hit-testing & Input
-    void RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover = false);
+    void RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover = false, bool isModal = false);
     void RegisterSlider(D2D1_RECT_F rc, std::string id, DragSlider kind);
     bool IsHovered(std::string_view id) const noexcept { return m_hoverId == id; }
     void UpdateSliderFromX(DragSlider kind, float dipX);
@@ -175,6 +187,20 @@ private:
 
     std::string          m_hoverId;
     std::vector<HitItem> m_hits;
+
+    // Auto-update state (shared state allows detached check thread to exit safely on quick shutdown)
+    struct UpdateShared {
+        std::mutex                 mtx;
+        HWND                       hwnd = nullptr;
+        std::optional<ReleaseInfo> found;
+        bool                       downloadOk = false;
+        std::filesystem::path      downloadedPath;
+    };
+    std::shared_ptr<UpdateShared> m_updateShared;
+    std::optional<ReleaseInfo>    m_availableUpdate;
+    bool                          m_updateModalOpen   = false;
+    bool                          m_updateDownloading = false;
+    bool                          m_updatePreviewOnly = false;
 
     // Smooth animation states (0 FPS when settled!)
     float        m_modeAnimT   = 0.0f; // 0 = CPS, 1 = KPS

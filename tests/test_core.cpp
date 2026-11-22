@@ -2,6 +2,7 @@
 #include "core/PerformanceMonitor.hpp"
 #include "core/ProfileManager.hpp"
 #include "core/TimingEngine.hpp"
+#include "core/UpdateChecker.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -47,6 +48,7 @@ int main() {
         orig.settings.hybridQpcTimer    = true;
         orig.settings.targetWindowLock  = true;
         orig.settings.targetProcessName = "RobloxPlayerBeta.exe";
+        orig.settings.checkForUpdates   = false;
         orig.cps.lockedMicroWiggle      = false;
 
         cadence::ProfileManager pm(orig);
@@ -71,6 +73,7 @@ int main() {
         CADENCE_ASSERT(loaded.kps.sequenceVks.size() == 5 && loaded.kps.sequenceVks[4] == 'E', "KPS sequence preserved");
         CADENCE_ASSERT(loaded.settings.stopOnSelfFocus, "Self-focus safety setting preserved");
         CADENCE_ASSERT(loaded.settings.targetWindowLock && loaded.settings.targetProcessName == "RobloxPlayerBeta.exe", "Target window lock preserved");
+        CADENCE_ASSERT(!loaded.settings.checkForUpdates, "checkForUpdates setting preserved");
         CADENCE_ASSERT(loaded.profiles.size() == orig.profiles.size(), "All profiles preserved");
 
         // Verify RFC-8259 \uXXXX Unicode escape decoding
@@ -152,8 +155,47 @@ int main() {
         const auto snap = pm.ComputeSnapshot(t, freq, true);
         CADENCE_ASSERT(snap.sessionCount == 20, "Session count matches exact recorded events");
         CADENCE_ASSERT(std::abs(snap.avgIntervalMs - 50.0) < 0.01, "Avg interval exact");
-        CADENCE_ASSERT(snap.actualRate >= 19.0 && snap.actualRate <= 21.0, "Measured CPS matches 20 CPS");
-        std::cout << "[PASS] PerformanceMonitor real rate & stats verification (" << snap.actualRate << " CPS)\n";
+        CADENCE_ASSERT(snap.actualRate >= 19.8 && snap.actualRate <= 20.2, "Measured CPS matches exact 20.0 CPS");
+
+        // Verify ResetSession cleanly isolates next session & fractional 14.5 CPS works immediately
+        pm.ResetSession();
+        const int64_t step145 = static_cast<int64_t>(static_cast<double>(freq) / 14.5);
+        int64_t t2 = timing.NowQpc() - step145 * 4;
+        for (int i = 0; i < 4; ++i) {
+            t2 += step145;
+            pm.RecordEvent(t2, 1000.0 / 14.5, 1000.0 / 14.5);
+        }
+        const auto snap2 = pm.ComputeSnapshot(t2, freq, true);
+        CADENCE_ASSERT(snap2.sessionCount == 4, "ResetSession isolates session count");
+        CADENCE_ASSERT(std::abs(snap2.actualRate - 14.5) < 0.15, "Fractional 14.5 CPS measured accurately");
+        std::cout << "[PASS] PerformanceMonitor exact fractional rate (" << snap2.actualRate << " CPS) & ResetSession\n";
+    }
+
+    // 5. UpdateChecker SemVer & GitHub Release JSON Parsing Verification
+    {
+        using cadence::SemVer;
+        using cadence::UpdateChecker;
+
+        const auto v1 = UpdateChecker::ParseSemVer("v1.2.3");
+        CADENCE_ASSERT(v1 && v1->major == 1 && v1->minor == 2 && v1->patch == 3, "ParseSemVer v1.2.3");
+        CADENCE_ASSERT(UpdateChecker::IsNewerVersion("v1.0.2", SemVer{1, 0, 1}), "v1.0.2 > 1.0.1");
+        CADENCE_ASSERT(UpdateChecker::IsNewerVersion("v2.0.0", SemVer{1, 9, 9}), "v2.0.0 > 1.9.9");
+        CADENCE_ASSERT(!UpdateChecker::IsNewerVersion("v1.0.1", SemVer{1, 0, 1}), "v1.0.1 == 1.0.1 not newer");
+        CADENCE_ASSERT(!UpdateChecker::IsNewerVersion("v1.0.0", SemVer{1, 0, 1}), "v1.0.0 < 1.0.1 not newer");
+
+        const std::string sampleJson = R"({
+            "tag_name": "v1.2.0",
+            "html_url": "https://github.com/solidvhdx/cadence/releases/tag/v1.2.0",
+            "assets": [
+                {"name": "notes.txt", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/notes.txt"},
+                {"name": "Cadence.exe", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe"}
+            ]
+        })";
+        const auto rel = UpdateChecker::ParseGitHubReleaseJson(sampleJson);
+        CADENCE_ASSERT(rel.has_value(), "ParseGitHubReleaseJson succeeds");
+        CADENCE_ASSERT(rel->tagName == "v1.2.0", "Parsed tag_name");
+        CADENCE_ASSERT(rel->downloadUrl == "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe", "Extracted Cadence.exe download URL");
+        std::cout << "[PASS] UpdateChecker SemVer & GitHub Release JSON parsing\n";
     }
 
     std::cout << "\nALL TESTS PASSED!\n";

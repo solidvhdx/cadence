@@ -56,9 +56,9 @@ public:
 private:
     void WorkerLoop(std::stop_token st);
     void RunCpsCycle(const CpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus,
-                     int64_t& nextTargetQpc, int64_t& lastEventQpc, uint64_t& sessionEvents);
+                     int64_t& nextTargetQpc, int64_t& lastEventQpc, double& expectedIntervalMs, uint64_t& sessionEvents);
     void RunKpsCycle(const KpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus,
-                     int64_t& nextTargetQpc, int64_t& lastEventQpc, uint64_t& sessionEvents, size_t& seqIndex);
+                     int64_t& nextTargetQpc, int64_t& lastEventQpc, double& expectedIntervalMs, uint64_t& sessionEvents, size_t& seqIndex);
 
     [[nodiscard]] bool IsSelfWindowBlocking(bool checkCursorForMouse, CursorMode cursorMode) const noexcept;
     [[nodiscard]] bool MatchesTargetWindowLock(const GlobalSettings& gs, HWND& cachedHwnd, bool& cachedMatch) const noexcept;

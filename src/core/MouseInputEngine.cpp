@@ -8,16 +8,6 @@ MouseInputEngine::~MouseInputEngine() {
     ReleaseAll();
 }
 
-std::atomic<uint64_t>& MouseInputEngine::InjectionEpoch() noexcept {
-    static std::atomic<uint64_t> epoch{0};
-    return epoch;
-}
-
-std::atomic<bool>& MouseInputEngine::IsInjecting() noexcept {
-    static std::atomic<bool> active{false};
-    return active;
-}
-
 DWORD MouseInputEngine::ButtonDownFlag(MouseButton button) noexcept {
     switch (button) {
         case MouseButton::Left:   return MOUSEEVENTF_LEFTDOWN;
@@ -54,39 +44,35 @@ bool MouseInputEngine::SendDown(MouseButton button, CursorMode cursorMode, int32
     INPUT inputs[3]{};
     UINT count = 0;
 
-    if (cursorMode == CursorMode::LockedPoint) {
+    if (cursorMode == CursorMode::LockedPoint && microWiggle) {
         inputs[count].type           = INPUT_MOUSE;
         inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
         ApplyAbsoluteVirtualCoords(inputs[count].mi, lockX, lockY);
         ++count;
 
-        if (microWiggle) {
-            // Subtle relative nudge so game UI hover states (e.g. Roblox GuiButton) trigger reliably
-            inputs[count].type           = INPUT_MOUSE;
-            inputs[count].mi.dx          = 1;
-            inputs[count].mi.dy          = 0;
-            inputs[count].mi.dwFlags     = MOUSEEVENTF_MOVE;
-            inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
-            ++count;
-        }
-    }
-
-    inputs[count].type           = INPUT_MOUSE;
-    inputs[count].mi.dwFlags     = ButtonDownFlag(button);
-    inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
-    if (cursorMode == CursorMode::LockedPoint && !microWiggle) {
-        // Combine into single event when no wiggle needed
-        ApplyAbsoluteVirtualCoords(inputs[0].mi, lockX, lockY);
-        inputs[0].mi.dwFlags |= ButtonDownFlag(button);
-        count = 1;
-    } else {
+        // Subtle relative nudge so game UI hover states (e.g. Roblox GuiButton) trigger reliably
+        inputs[count].type           = INPUT_MOUSE;
+        inputs[count].mi.dx          = 1;
+        inputs[count].mi.dy          = 0;
+        inputs[count].mi.dwFlags     = MOUSEEVENTF_MOVE;
+        inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
         ++count;
+
+        inputs[count].type           = INPUT_MOUSE;
+        inputs[count].mi.dwFlags     = ButtonDownFlag(button);
+        inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
+        ++count;
+    } else {
+        inputs[0].type           = INPUT_MOUSE;
+        inputs[0].mi.dwFlags     = ButtonDownFlag(button);
+        inputs[0].mi.dwExtraInfo = kCadenceInjectedTag;
+        if (cursorMode == CursorMode::LockedPoint) {
+            ApplyAbsoluteVirtualCoords(inputs[0].mi, lockX, lockY);
+        }
+        count = 1;
     }
 
-    IsInjecting().store(true, std::memory_order_release);
-    InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(count, inputs, sizeof(INPUT));
-    IsInjecting().store(false, std::memory_order_release);
 
     if (sent == count) {
         const uint8_t bit = static_cast<uint8_t>(1u << static_cast<uint8_t>(button));
@@ -106,10 +92,7 @@ bool MouseInputEngine::SendUp(MouseButton button, CursorMode cursorMode, int32_t
         ApplyAbsoluteVirtualCoords(input.mi, lockX, lockY);
     }
 
-    IsInjecting().store(true, std::memory_order_release);
-    InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
     const UINT sent = SendInput(1, &input, sizeof(INPUT));
-    IsInjecting().store(false, std::memory_order_release);
 
     const uint8_t bit = static_cast<uint8_t>(1u << static_cast<uint8_t>(button));
     m_heldMask.fetch_and(static_cast<uint8_t>(~bit), std::memory_order_acq_rel);
@@ -145,10 +128,7 @@ void MouseInputEngine::ReleaseAll() noexcept {
     }
 
     if (count > 0) {
-        IsInjecting().store(true, std::memory_order_release);
-        InjectionEpoch().fetch_add(1, std::memory_order_acq_rel);
         SendInput(count, inputs, sizeof(INPUT));
-        IsInjecting().store(false, std::memory_order_release);
     }
 }
 

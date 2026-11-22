@@ -31,6 +31,7 @@ Config and presets are saved automatically to `%APPDATA%\Cadence\config.json`.
 - **Global Hotkeys**: Uses Raw Input (`RIDEV_INPUTSINK`) instead of global hooks, so mouse side buttons (`X1`, `X2`, `Middle`) and keyboard keys work without input lag. Synthetic `SendInput` events are filtered out.
 - **Safety**: Automatically stops or arms when the Cadence window is focused/hovered, optional Target-Window Lock so it only fires inside a specific process, plus a global kill hotkey (`F12`).
 - **Telemetry & Profiles**: Live measured CPS/KPS, P99 error, sparkline graph, system tray mode, and JSON profile import/export.
+- **Auto-Updater**: Checks GitHub Releases on startup via native WinHTTP and lets you update and restart in-app, postpone, or ignore updates (can also be toggled in Settings).
 
 ## Default Hotkeys
 

@@ -42,10 +42,11 @@ void PerformanceMonitor::RecordEvent(int64_t timestampQpc,
 }
 
 void PerformanceMonitor::ResetSession() noexcept {
-    m_writeIdx.store(0, std::memory_order_release);
+    // Never mutate m_writeIdx from outside the worker thread; advance session base lock-free instead
+    const uint64_t curWrite = m_writeIdx.load(std::memory_order_acquire);
+    m_sessionBaseIdx.store(curWrite, std::memory_order_release);
     m_sessionCount.store(0, std::memory_order_relaxed);
-    m_history.fill(0.0f);
-    m_historyCount = 0;
+    m_clearHistory.store(true, std::memory_order_release);
 }
 
 TelemetrySnapshot PerformanceMonitor::ComputeSnapshot(int64_t nowQpc,
@@ -83,13 +84,22 @@ TelemetrySnapshot PerformanceMonitor::ComputeSnapshot(int64_t nowQpc,
     snap.cpuPercent = m_lastCpuPercent;
     snap.memoryMb   = m_lastMemoryMb;
 
+    if (m_clearHistory.exchange(false, std::memory_order_acq_rel)) {
+        m_history.fill(0.0f);
+        m_historyCount = 0;
+    }
+
     // 2. Analyze recent real QPC timestamps from lock-free ring buffer
     const uint64_t totalWritten = m_writeIdx.load(std::memory_order_acquire);
-    const size_t available = static_cast<size_t>(std::min<uint64_t>(totalWritten, kRingSize));
+    const uint64_t sessionBase  = m_sessionBaseIdx.load(std::memory_order_acquire);
+    const uint64_t sessionSpan  = (totalWritten > sessionBase) ? (totalWritten - sessionBase) : 0;
+    const size_t available = static_cast<size_t>(std::min<uint64_t>(sessionSpan, kRingSize));
 
     if (available > 0 && qpcFreq > 0) {
         const int64_t window1s = qpcFreq; // 1.0 second in QPC ticks
         uint32_t eventsInLastSec = 0;
+        int64_t  newestInWinQpc  = 0;
+        int64_t  oldestInWinQpc  = 0;
 
         // Stack-allocated scratch buffers: 0 heap allocations per telemetry tick
         std::array<double, 200> intervals{};
@@ -102,6 +112,8 @@ TelemetrySnapshot PerformanceMonitor::ComputeSnapshot(int64_t nowQpc,
             const Sample s = m_ring[idx & kRingMask];
 
             if (nowQpc - s.timestampQpc <= window1s) {
+                if (eventsInLastSec == 0) newestInWinQpc = s.timestampQpc;
+                oldestInWinQpc = s.timestampQpc;
                 ++eventsInLastSec;
             }
             if (intervalCount < intervals.size() && s.actualIntervalMs > 0.0) {
@@ -127,9 +139,14 @@ TelemetrySnapshot PerformanceMonitor::ComputeSnapshot(int64_t nowQpc,
 
             if (isRunning && eventsInLastSec > 0) {
                 const double rateFromInterval = avg > 0.001 ? (1000.0 / avg) : 0.0;
-                snap.actualRate = (eventsInLastSec >= 2)
-                    ? static_cast<double>(eventsInLastSec)
-                    : rateFromInterval;
+                if (eventsInLastSec >= 2 && newestInWinQpc > oldestInWinQpc) {
+                    const double spanSec = static_cast<double>(newestInWinQpc - oldestInWinQpc) / static_cast<double>(qpcFreq);
+                    snap.actualRate = (spanSec > 0.0005)
+                        ? (static_cast<double>(eventsInLastSec - 1) / spanSec)
+                        : rateFromInterval;
+                } else {
+                    snap.actualRate = rateFromInterval;
+                }
             }
         }
 

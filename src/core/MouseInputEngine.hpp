@@ -25,10 +25,6 @@ public:
     // Immediately releases any buttons currently held by this engine
     void ReleaseAll() noexcept;
 
-    // Monotonic counter incremented around SendInput calls (helps Raw Input filter synthetic events)
-    static std::atomic<uint64_t>& InjectionEpoch() noexcept;
-    static std::atomic<bool>&     IsInjecting() noexcept;
-
 private:
     static DWORD ButtonDownFlag(MouseButton button) noexcept;
     static DWORD ButtonUpFlag(MouseButton button) noexcept;

@@ -37,7 +37,9 @@ private:
 
     std::array<Sample, kRingSize> m_ring{};
     std::atomic<uint64_t>         m_writeIdx{0};
+    std::atomic<uint64_t>         m_sessionBaseIdx{0};
     std::atomic<uint64_t>         m_sessionCount{0};
+    std::atomic<bool>             m_clearHistory{false};
 
     // UI-thread-only rolling history & CPU delta tracking
     std::array<float, 40> m_history{};

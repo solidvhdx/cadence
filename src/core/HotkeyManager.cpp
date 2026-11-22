@@ -73,25 +73,40 @@ void HotkeyManager::UnregisterPanicFallback() {
     }
 }
 
-void HotkeyManager::BeginCapture(bool allowMouseButtons, std::function<void(HotkeyBinding)> onCaptured) {
-    m_capturing         = true;
-    m_captureAllowMouse = allowMouseButtons;
-    m_captureCallback   = std::move(onCaptured);
+void HotkeyManager::BeginCapture(bool allowMouseButtons,
+                                 std::function<void(HotkeyBinding)> onCaptured,
+                                 std::function<void()> onCancelled) {
+    m_capturing             = true;
+    m_captureAllowMouse     = allowMouseButtons;
+    m_captureCallback       = std::move(onCaptured);
+    m_captureCancelCallback = std::move(onCancelled);
 }
 
 void HotkeyManager::CancelCapture() {
-    m_capturing       = false;
-    m_captureCallback = nullptr;
+    auto cancelCb = std::move(m_captureCancelCallback);
+    m_capturing             = false;
+    m_captureCallback       = nullptr;
+    m_captureCancelCallback = nullptr;
+    if (cancelCb) {
+        cancelCb();
+    }
 }
 
-void HotkeyManager::BeginGlobalLeftClickCapture(std::function<void(POINT, HWND)> onPicked) {
-    m_pickingLeftClick  = true;
-    m_leftClickCallback = std::move(onPicked);
+void HotkeyManager::BeginGlobalLeftClickCapture(std::function<void(POINT, HWND)> onPicked,
+                                                std::function<void()> onCancelled) {
+    m_pickingLeftClick        = true;
+    m_leftClickCallback       = std::move(onPicked);
+    m_leftClickCancelCallback = std::move(onCancelled);
 }
 
 void HotkeyManager::CancelLeftClickCapture() {
-    m_pickingLeftClick  = false;
-    m_leftClickCallback = nullptr;
+    auto cancelCb = std::move(m_leftClickCancelCallback);
+    m_pickingLeftClick        = false;
+    m_leftClickCallback       = nullptr;
+    m_leftClickCancelCallback = nullptr;
+    if (cancelCb) {
+        cancelCb();
+    }
 }
 
 void HotkeyManager::ProcessWmHotkey(WPARAM wParam) {
@@ -158,7 +173,8 @@ void HotkeyManager::ProcessRawInput(LPARAM lParam) {
             HWND under = WindowFromPoint(pt);
             if (under) under = GetAncestor(under, GA_ROOT);
             auto cb = std::move(m_leftClickCallback);
-            m_pickingLeftClick = false;
+            m_pickingLeftClick        = false;
+            m_leftClickCancelCallback = nullptr;
             if (cb) {
                 cb(pt, under);
             }
@@ -186,7 +202,8 @@ void HotkeyManager::HandleKeyTransition(uint16_t vk, bool isDown) {
                 return;
             }
             auto cb = std::move(m_captureCallback);
-            m_capturing = false;
+            m_capturing             = false;
+            m_captureCancelCallback = nullptr;
             if (cb) {
                 cb(HotkeyBinding{HotkeySource::Keyboard, vk});
             }
@@ -208,7 +225,8 @@ void HotkeyManager::HandleMouseTransition(uint16_t mouseVk, bool isDown) {
             return;
         }
         auto cb = std::move(m_captureCallback);
-        m_capturing = false;
+        m_capturing             = false;
+        m_captureCancelCallback = nullptr;
         if (cb) {
             cb(HotkeyBinding{HotkeySource::Mouse, mouseVk});
         }

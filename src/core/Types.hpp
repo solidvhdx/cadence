@@ -123,6 +123,7 @@ struct GlobalSettings {
     std::string   targetProcessName    = "";    // e.g. "RobloxPlayerBeta.exe"
     bool          minimizeToTray       = true;
     bool          alwaysOnTop          = false;
+    bool          checkForUpdates      = true;  // Check GitHub Releases for new versions on startup
     HotkeyBinding panicHotkey          = {HotkeySource::Keyboard, VK_F12};
 };
 

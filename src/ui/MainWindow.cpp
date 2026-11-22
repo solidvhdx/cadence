@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <thread>
 
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
@@ -126,6 +127,10 @@ void MainWindow::ShowToast(std::wstring text, bool isDanger) {
 }
 
 MainWindow::~MainWindow() {
+    if (m_updateShared) {
+        std::scoped_lock lock(m_updateShared->mtx);
+        m_updateShared->hwnd = nullptr;
+    }
     RemoveTrayIcon();
     m_hotkeys.Shutdown();
     m_engine.Stop();
@@ -205,7 +210,9 @@ HICON MainWindow::CreateAppIcon(int sizePx, uint32_t coreArgb) {
         }
     }
 
-    HBITMAP hMask = CreateBitmap(sizePx, sizePx, 1, 1, nullptr);
+    const size_t maskStride = ((static_cast<size_t>(sizePx) + 15u) / 16u) * 2u;
+    std::vector<BYTE> maskBits(maskStride * static_cast<size_t>(sizePx), 0);
+    HBITMAP hMask = CreateBitmap(sizePx, sizePx, 1, 1, maskBits.data());
     ICONINFO ii{};
     ii.fIcon    = TRUE;
     ii.hbmColor = hColor;
@@ -216,7 +223,7 @@ HICON MainWindow::CreateAppIcon(int sizePx, uint32_t coreArgb) {
     return icon ? icon : LoadIconW(nullptr, IDI_APPLICATION);
 }
 
-bool MainWindow::Create(HINSTANCE hInstance) {
+bool MainWindow::Create(HINSTANCE hInstance, bool previewUpdate) {
     m_hInstance       = hInstance;
     m_iconBig         = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON, 48, 48, LR_DEFAULTCOLOR));
     if (!m_iconBig)   m_iconBig = CreateAppIcon(32, 0xFF7C5CFC);
@@ -243,17 +250,12 @@ bool MainWindow::Create(HINSTANCE hInstance) {
 
     const int initW = static_cast<int>(m_widthDip);
     const int initH = static_cast<int>(m_heightDip);
-    const int screenW = GetSystemMetrics(SM_CXSCREEN);
-    const int screenH = GetSystemMetrics(SM_CYSCREEN);
-    const int posX = std::max(40, (screenW - initW) / 2);
-    const int posY = std::max(40, (screenH - initH) / 2);
-
     m_hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         kWindowClassName,
         L"Cadence",
         WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_SYSMENU,
-        posX, posY, initW, initH,
+        0, 0, initW, initH,
         nullptr, nullptr, hInstance, this
     );
     if (!m_hwnd) {
@@ -262,7 +264,16 @@ bool MainWindow::Create(HINSTANCE hInstance) {
 
     m_dpi = static_cast<float>(GetDpiForWindow(m_hwnd));
     ApplyWindowChrome();
-    UpdateWindowSizeForLayout(true);
+    // Center using actual DPI-scaled pixel dimensions on the primary work area
+    const int scaledW = DipToPx(m_widthDip);
+    const int scaledH = DipToPx(m_heightDip);
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int workW = workArea.right - workArea.left;
+    const int workH = workArea.bottom - workArea.top;
+    const int posX  = workArea.left + std::max(24, (workW - scaledW) / 2);
+    const int posY  = workArea.top  + std::max(24, (workH - scaledH) / 2);
+    SetWindowPos(m_hwnd, nullptr, posX, posY, scaledW, scaledH, SWP_NOZORDER | SWP_NOACTIVATE);
 
     RECT rc{};
     GetClientRect(m_hwnd, &rc);
@@ -281,10 +292,22 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     });
 
     HotkeyCallbacks cbs{};
-    cbs.onCpsPress   = [this]() { m_engine.HandleHotkeyPress(OperatingMode::CPS); };
-    cbs.onCpsRelease = [this]() { m_engine.HandleHotkeyRelease(OperatingMode::CPS); };
-    cbs.onKpsPress   = [this]() { m_engine.HandleHotkeyPress(OperatingMode::KPS); };
-    cbs.onKpsRelease = [this]() { m_engine.HandleHotkeyRelease(OperatingMode::KPS); };
+    cbs.onCpsPress   = [this]() {
+        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        m_engine.HandleHotkeyPress(OperatingMode::CPS);
+    };
+    cbs.onCpsRelease = [this]() {
+        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        m_engine.HandleHotkeyRelease(OperatingMode::CPS);
+    };
+    cbs.onKpsPress   = [this]() {
+        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        m_engine.HandleHotkeyPress(OperatingMode::KPS);
+    };
+    cbs.onKpsRelease = [this]() {
+        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        m_engine.HandleHotkeyRelease(OperatingMode::KPS);
+    };
     cbs.onPanicStop  = [this]() {
         m_engine.PanicStop();
         ShowToast(L"Halted — all inputs released", true);
@@ -294,6 +317,21 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     SyncEngineAndHotkeys();
     SetAlwaysOnTop(m_config.settings.alwaysOnTop);
     InitTrayIcon();
+
+    m_updateShared = std::make_shared<UpdateShared>();
+    m_updateShared->hwnd = m_hwnd;
+
+    if (previewUpdate) {
+        ReleaseInfo demo{};
+        demo.tagName     = "v1.1.0";
+        demo.version     = {1, 1, 0};
+        demo.releaseUrl  = "https://github.com/solidvhdx/cadence/releases/latest";
+        m_availableUpdate   = std::move(demo);
+        m_updateModalOpen   = true;
+        m_updatePreviewOnly = true;
+    } else if (m_config.settings.checkForUpdates) {
+        StartUpdateCheckAsync();
+    }
 
     ShowWindow(m_hwnd, SW_SHOW);
     UpdateWindow(m_hwnd);
@@ -318,8 +356,8 @@ float MainWindow::ComputeDesiredHeightDip() const noexcept {
         return base + 206.0f;
     }
     if (m_tab == ViewTab::Settings) {
-        // 6 toggles (264) + target lock subrow (28 if on) + panic row (42) + actions row (44)
-        return base + 350.0f + (m_config.settings.targetWindowLock ? 28.0f : 0.0f);
+        // 7 toggles (308) + target lock subrow (28 if on) + panic row (42) + actions row (44)
+        return base + 394.0f + (m_config.settings.targetWindowLock ? 28.0f : 0.0f);
     }
 
     const bool isCps    = (m_config.activeMode == OperatingMode::CPS);
@@ -610,6 +648,51 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        case WM_APP_UPDATE_AVAILABLE: {
+            if (m_updateShared && m_config.settings.checkForUpdates) {
+                std::scoped_lock lock(m_updateShared->mtx);
+                if (m_updateShared->found) {
+                    m_availableUpdate = m_updateShared->found;
+                    m_updateModalOpen = true;
+                    m_profileOpen     = false;
+                    RequestRender();
+                }
+            }
+            return 0;
+        }
+
+        case WM_APP_UPDATE_DONE: {
+            bool ok = false;
+            std::filesystem::path dlPath;
+            if (m_updateShared) {
+                std::scoped_lock lock(m_updateShared->mtx);
+                ok     = m_updateShared->downloadOk;
+                dlPath = m_updateShared->downloadedPath;
+            }
+            m_updateDownloading = false;
+            if (ok && !dlPath.empty()) {
+                m_engine.Stop();
+                SaveConfigNow();
+                if (UpdateChecker::ApplyUpdateAndRelaunch(dlPath)) {
+                    DestroyWindow(m_hwnd);
+                    return 0;
+                }
+                // Fallback if current folder is read-only (e.g. Program Files without admin): open release page
+                std::error_code ec;
+                std::filesystem::remove(dlPath, ec);
+                if (m_availableUpdate && !m_availableUpdate->releaseUrl.empty()) {
+                    const std::wstring url = Utf8ToWide(m_availableUpdate->releaseUrl);
+                    ShellExecuteW(m_hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                m_updateModalOpen = false;
+                ShowToast(L"Opened GitHub release (folder not writable)", false);
+            } else {
+                ShowToast(L"Update download failed", true);
+            }
+            RequestRender();
+            return 0;
+        }
+
         case WM_TIMER:
             if (wParam == kTimerAnim) {
                 StepAnimations();
@@ -727,6 +810,9 @@ void MainWindow::Render(HDC paintDc) {
 
     if (m_profileOpen) {
         RenderProfilePopover();
+    }
+    if (m_updateModalOpen && m_availableUpdate) {
+        RenderUpdateModal(w, h);
     }
     if (m_toastMs > 0.0f) {
         RenderToast(w, h);
@@ -1508,6 +1594,7 @@ void MainWindow::RenderSettingsTab(float w, float& y) {
     drawToggle(L"Ignore Win11 throttling", L"Keeps sub-ms accuracy when minimized", &m_config.settings.disablePowerThrottle, "set_thr");
     drawToggle(L"MMCSS thread priority", L"Pro Audio scheduling while active", &m_config.settings.mmcssPriority, "set_mmcss");
     drawToggle(L"Minimize to system tray", L"Trims RAM & pauses UI when hidden", &m_config.settings.minimizeToTray, "set_tray");
+    drawToggle(L"Check for updates", L"Notifies when a new GitHub release is available", &m_config.settings.checkForUpdates, "set_upd");
 
     // Emergency Kill Keybind
     const float rh = 42.0f;
@@ -1729,6 +1816,187 @@ void MainWindow::RenderProfilePopover() {
     }, true);
 }
 
+void MainWindow::RenderUpdateModal(float w, float h) {
+    if (!m_availableUpdate) return;
+    const auto& rel = *m_availableUpdate;
+    const D2D1_COLOR_F accent = ActiveAccent();
+
+    // Dimmed backdrop covering entire window
+    m_renderer.FillRect({0.0f, 0.0f, w, h}, HexColor(0x000000, 0.64f));
+
+    const float cardW = w - 48.0f;
+    const float cardH = 216.0f;
+    const float cardL = (w - cardW) * 0.5f;
+    const float cardT = std::max(54.0f, (h - cardH) * 0.5f - 6.0f);
+    const D2D1_RECT_F card{cardL, cardT, cardL + cardW, cardT + cardH};
+
+    // Elevation shadow + Obsidian modal card
+    m_renderer.FillRoundedRect({card.left, card.top + 6.0f, card.right, card.bottom + 10.0f}, 12.0f, HexColor(0x000000, 0.55f));
+    m_renderer.FillRoundedRect(card, 12.0f, ThemeTokens::kBgPopover);
+    m_renderer.DrawRoundedRect(card, 12.0f, ThemeTokens::kHairlineStrong);
+    m_renderer.DrawLine(card.left + 16.0f, card.top + 1.0f, card.right - 16.0f, card.top + 1.0f, HexColor(0x7C5CFC, 0.50f));
+
+    const float pad = 20.0f;
+    const float innerL = card.left + pad;
+    const float innerR = card.right - pad;
+
+    // Header: Cube logo + Title + Close X
+    m_renderer.DrawCubeLogo(innerL, card.top + 19.0f, 16.0f, accent);
+    m_renderer.DrawText(L"Update available", {innerL + 24.0f, card.top + 15.0f, innerR - 28.0f, card.top + 39.0f},
+                        TextStyle::Title, ThemeTokens::kTextPrimary);
+
+    const D2D1_RECT_F closeRc{innerR - 22.0f, card.top + 15.0f, innerR + 2.0f, card.top + 39.0f};
+    if (!m_updateDownloading && IsHovered("upd_close")) {
+        m_renderer.FillRoundedRect(closeRc, 5.0f, HexColor(0xFFFFFF, 0.06f));
+    }
+    m_renderer.DrawCloseIcon((closeRc.left + closeRc.right) * 0.5f, (closeRc.top + closeRc.bottom) * 0.5f,
+                             IsHovered("upd_close") ? ThemeTokens::kTextPrimary : ThemeTokens::kTextMuted);
+    if (!m_updateDownloading) {
+        RegisterHit(closeRc, "upd_close", [this]() {
+            m_updateModalOpen = false;
+            RequestRender();
+        }, false, true);
+    }
+
+    // Version comparison pill: v1.0.1 -> v1.1.0
+    const D2D1_RECT_F verPill{innerL, card.top + 50.0f, innerR, card.top + 78.0f};
+    m_renderer.FillRoundedRect(verPill, 7.0f, ThemeTokens::kBgRecessed);
+    m_renderer.DrawRoundedRect(verPill, 7.0f, ThemeTokens::kHairline);
+
+    const std::wstring curVer = L"v" + Utf8ToWide(CADENCE_VERSION_STR);
+    const std::wstring newVer = Utf8ToWide(rel.tagName);
+    const float curW   = m_renderer.MeasureTextWidth(curVer, TextStyle::MonoSmall);
+    const float arrowW = m_renderer.MeasureTextWidth(L" -> ", TextStyle::MonoSmall);
+
+    m_renderer.DrawText(curVer, {verPill.left + 12.0f, verPill.top, verPill.left + 12.0f + curW + 4.0f, verPill.bottom},
+                        TextStyle::MonoSmall, ThemeTokens::kTextSecondary);
+    m_renderer.DrawText(L" -> ", {verPill.left + 12.0f + curW, verPill.top, verPill.left + 12.0f + curW + arrowW + 4.0f, verPill.bottom},
+                        TextStyle::MonoSmall, ThemeTokens::kTextMuted);
+    m_renderer.DrawText(newVer, {verPill.left + 12.0f + curW + arrowW, verPill.top, verPill.right - 92.0f, verPill.bottom},
+                        TextStyle::MonoSmall, ThemeTokens::kEmerald);
+    m_renderer.DrawText(L"GitHub Release", {verPill.right - 102.0f, verPill.top, verPill.right - 12.0f, verPill.bottom},
+                        TextStyle::Caption, ThemeTokens::kTextMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+    // Description
+    m_renderer.DrawText(L"A newer version of Cadence is ready.",
+                        {innerL, card.top + 88.0f, innerR, card.top + 106.0f}, TextStyle::Body, ThemeTokens::kTextPrimary);
+    m_renderer.DrawText(m_updateDownloading ? L"Downloading Cadence.exe from GitHub…" : L"Downloads Cadence.exe and restarts automatically.",
+                        {innerL, card.top + 107.0f, innerR, card.top + 123.0f}, TextStyle::Caption, ThemeTokens::kTextMuted);
+
+    // Primary CTA: Update now
+    const D2D1_RECT_F updRc{innerL, card.top + 134.0f, innerR, card.top + 168.0f};
+    const D2D1_COLOR_F ctaBg = m_updateDownloading
+        ? ThemeTokens::kBgElevated
+        : ActiveAccent(IsHovered("upd_now"));
+    m_renderer.FillRoundedRect(updRc, ThemeTokens::kRadiusButton, ctaBg);
+    m_renderer.DrawRoundedRect(updRc, ThemeTokens::kRadiusButton, m_updateDownloading ? accent : HexColor(0xFFFFFF, 0.14f));
+    if (!m_updateDownloading) {
+        m_renderer.DrawLine(updRc.left + 8.0f, updRc.top + 1.0f, updRc.right - 8.0f, updRc.top + 1.0f, HexColor(0xFFFFFF, 0.15f));
+    }
+    m_renderer.DrawText(m_updateDownloading ? L"Downloading…" : L"Update now",
+                        updRc, TextStyle::BodyMedium, ThemeTokens::kTextWhite, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (!m_updateDownloading) {
+        RegisterHit(updRc, "upd_now", [this]() {
+            if (m_updatePreviewOnly) {
+                ShowToast(L"Preview mode — update button works!", false);
+                return;
+            }
+            StartUpdateDownloadAsync();
+        }, false, true);
+    }
+
+    // Secondary row: Later | Ignore updates
+    const float btnGap = 8.0f;
+    const float btnW   = (innerR - innerL - btnGap) * 0.5f;
+    const D2D1_RECT_F laterRc{innerL, card.top + 176.0f, innerL + btnW, card.top + 202.0f};
+    const D2D1_RECT_F ignRc  {laterRc.right + btnGap, card.top + 176.0f, innerR, card.top + 202.0f};
+
+    m_renderer.FillRoundedRect(laterRc, 6.0f, (!m_updateDownloading && IsHovered("upd_later")) ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
+    m_renderer.DrawRoundedRect(laterRc, 6.0f, ThemeTokens::kHairlineStrong);
+    m_renderer.DrawText(L"Later", laterRc, TextStyle::Body, ThemeTokens::kTextPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    m_renderer.FillRoundedRect(ignRc, 6.0f, (!m_updateDownloading && IsHovered("upd_ignore")) ? ThemeTokens::kBgElevated : ThemeTokens::kBgRecessed);
+    m_renderer.DrawRoundedRect(ignRc, 6.0f, ThemeTokens::kHairline);
+    m_renderer.DrawText(L"Ignore updates", ignRc, TextStyle::Body,
+                        (!m_updateDownloading && IsHovered("upd_ignore")) ? ThemeTokens::kTextPrimary : ThemeTokens::kTextSecondary,
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    if (!m_updateDownloading) {
+        RegisterHit(laterRc, "upd_later", [this]() {
+            m_updateModalOpen = false;
+            RequestRender();
+        }, false, true);
+
+        RegisterHit(ignRc, "upd_ignore", [this]() {
+            m_config.settings.checkForUpdates = false;
+            m_updateModalOpen = false;
+            SaveConfigNow();
+            ShowToast(L"Updates ignored (re-enable in Settings)", false);
+        }, false, true);
+    }
+}
+
+void MainWindow::StartUpdateCheckAsync() {
+    auto shared = m_updateShared;
+    if (!shared) return;
+
+    std::thread([shared]() {
+        auto rel = UpdateChecker::CheckForUpdate();
+        if (!rel) return;
+
+        HWND target = nullptr;
+        {
+            std::scoped_lock lock(shared->mtx);
+            shared->found = std::move(rel);
+            target        = shared->hwnd;
+        }
+        if (target) {
+            PostMessageW(target, WM_APP_UPDATE_AVAILABLE, 0, 0);
+        }
+    }).detach();
+}
+
+void MainWindow::StartUpdateDownloadAsync() {
+    if (!m_availableUpdate || m_updateDownloading) return;
+
+    if (m_availableUpdate->downloadUrl.empty()) {
+        const std::wstring url = Utf8ToWide(m_availableUpdate->releaseUrl);
+        ShellExecuteW(m_hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        m_updateModalOpen = false;
+        RequestRender();
+        return;
+    }
+
+    auto shared = m_updateShared;
+    if (!shared) return;
+
+    m_updateDownloading = true;
+    RequestRender();
+
+    const std::string dlUrl = m_availableUpdate->downloadUrl;
+    std::filesystem::path dest = UpdateChecker::CurrentExePath();
+    if (dest.empty()) {
+        m_updateDownloading = false;
+        ShowToast(L"Could not locate current executable", true);
+        return;
+    }
+    dest += L".new";
+
+    std::thread([shared, dlUrl, dest]() {
+        const bool ok = UpdateChecker::DownloadBinary(dlUrl, dest);
+        HWND target = nullptr;
+        {
+            std::scoped_lock lock(shared->mtx);
+            shared->downloadOk     = ok;
+            shared->downloadedPath = ok ? dest : std::filesystem::path{};
+            target                 = shared->hwnd;
+        }
+        if (target) {
+            PostMessageW(target, WM_APP_UPDATE_DONE, 0, 0);
+        }
+    }).detach();
+}
+
 void MainWindow::RenderToast(float w, float h) {
     const D2D1_RECT_F rc{16.0f, h - 118.0f, w - 16.0f, h - 88.0f};
     m_renderer.FillRoundedRect(rc, 7.0f, m_toastDanger ? ThemeTokens::kDangerSurface : ThemeTokens::kBgElevated);
@@ -1741,12 +2009,12 @@ void MainWindow::RenderToast(float w, float h) {
 // HIT REGISTRATION & INTERACTION
 // =============================================================================
 
-void MainWindow::RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover) {
-    m_hits.push_back(HitItem{rc, std::move(id), std::move(onClick), false, DragSlider::None, isPopover});
+void MainWindow::RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover, bool isModal) {
+    m_hits.push_back(HitItem{rc, std::move(id), std::move(onClick), false, DragSlider::None, isPopover, isModal});
 }
 
 void MainWindow::RegisterSlider(D2D1_RECT_F rc, std::string id, DragSlider kind) {
-    m_hits.push_back(HitItem{rc, std::move(id), nullptr, true, kind, false});
+    m_hits.push_back(HitItem{rc, std::move(id), nullptr, true, kind, false, false});
 }
 
 void MainWindow::UpdateSliderFromX(DragSlider kind, float dipX) {
@@ -1777,7 +2045,8 @@ void MainWindow::HandleMouseMove(float dipX, float dipY) {
 
     std::string newHover;
     for (auto it = m_hits.rbegin(); it != m_hits.rend(); ++it) {
-        if (m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
+        if (m_updateModalOpen && !it->isModal) continue;
+        if (!m_updateModalOpen && m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
         if (PtInRectF(it->rect, dipX, dipY)) {
             newHover = it->id;
             break;
@@ -1792,7 +2061,8 @@ void MainWindow::HandleMouseMove(float dipX, float dipY) {
 void MainWindow::HandleLButtonDown(float dipX, float dipY) {
     bool hitPopover = false;
     for (auto it = m_hits.rbegin(); it != m_hits.rend(); ++it) {
-        if (m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
+        if (m_updateModalOpen && !it->isModal) continue;
+        if (!m_updateModalOpen && m_profileOpen && !it->isPopover && it->id != "profile_btn") continue;
         if (PtInRectF(it->rect, dipX, dipY)) {
             hitPopover = it->isPopover || it->id == "profile_btn";
             if (m_editingRate && it->id != "rate_edit") CommitRateEdit();
@@ -1807,6 +2077,7 @@ void MainWindow::HandleLButtonDown(float dipX, float dipY) {
             return;
         }
     }
+    if (m_updateModalOpen) return;
     if (m_editingRate) CommitRateEdit();
     if (m_profileOpen && !hitPopover) {
         m_profileOpen   = false;
@@ -1825,7 +2096,7 @@ void MainWindow::HandleLButtonUp() {
 }
 
 void MainWindow::HandleMouseWheel(int delta) {
-    if (m_tab != ViewTab::Controls || m_profileOpen || m_editingRate) return;
+    if (m_tab != ViewTab::Controls || m_profileOpen || m_editingRate || m_updateModalOpen) return;
     const double cur  = (m_config.activeMode == OperatingMode::CPS) ? m_config.cps.rateCps : m_config.kps.rateKps;
     const double mag  = (cur >= 50.0) ? 5.0 : 0.5;
     const double step = (delta > 0) ? mag : -mag;
@@ -1857,6 +2128,13 @@ void MainWindow::HandleCharInput(wchar_t ch) {
 }
 
 void MainWindow::HandleKeyDown(WPARAM vk) {
+    if (m_updateModalOpen) {
+        if (vk == VK_ESCAPE && !m_updateDownloading) {
+            m_updateModalOpen = false;
+            RequestRender();
+        }
+        return;
+    }
     if (m_editingRate) {
         if (vk == VK_RETURN) {
             CommitRateEdit();
@@ -1950,6 +2228,9 @@ void MainWindow::BeginKeyCapture(CaptureKind kind) {
         SyncEngineAndHotkeys();
         SaveConfigNow();
         RequestRender();
+    }, [this]() {
+        m_captureKind = CaptureKind::None;
+        RequestRender();
     });
     RequestRender();
 }
@@ -1971,6 +2252,9 @@ void MainWindow::BeginGlobalPick(PickKind kind) {
         m_pickKind = PickKind::None;
         SyncEngineAndHotkeys();
         SaveConfigNow();
+        RequestRender();
+    }, [this]() {
+        m_pickKind = PickKind::None;
         RequestRender();
     });
     RequestRender();

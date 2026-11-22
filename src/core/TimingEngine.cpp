@@ -11,6 +11,10 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+#ifndef PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+#define PROCESS_POWER_THROTTLING_EXECUTION_SPEED 0x1
+#endif
+
 #ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
 #define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
 #endif
@@ -88,10 +92,13 @@ TimingEngine::~TimingEngine() {
 }
 
 bool TimingEngine::SetPowerThrottlingDisabled(bool disable) noexcept {
+    // When disable == true: explicitly opt out of Win11 timer-resolution throttling & EcoQoS CPU speed throttling.
+    // When disable == false: clear ControlMask so Windows manages power throttling with its OS defaults.
+    constexpr ULONG kMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
     PROCESS_POWER_THROTTLING_STATE state{};
     state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    state.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-    state.StateMask   = disable ? 0 : PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    state.ControlMask = disable ? kMask : 0;
+    state.StateMask   = 0;
 
     return SetProcessInformation(
         GetCurrentProcess(),

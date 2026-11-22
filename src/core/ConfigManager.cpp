@@ -204,10 +204,18 @@ std::string EscapeJson(std::string_view s) {
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default:   out.push_back(c); break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+                } else {
+                    out.push_back(c);
+                }
+                break;
         }
     }
     out.push_back('"');
@@ -395,7 +403,7 @@ std::filesystem::path ConfigManager::DefaultConfigPath() {
 std::string ConfigManager::Serialize(const AppConfig& config) {
     const auto& s = config.settings;
     std::string settingsJson = std::format(
-        R"({{"hybridQpcTimer":{},"disablePowerThrottle":{},"mmcssPriority":{},"stopOnSelfFocus":{},"targetWindowLock":{},"targetProcessName":{},"minimizeToTray":{},"alwaysOnTop":{},"panicHotkey":{}}})",
+        R"({{"hybridQpcTimer":{},"disablePowerThrottle":{},"mmcssPriority":{},"stopOnSelfFocus":{},"targetWindowLock":{},"targetProcessName":{},"minimizeToTray":{},"alwaysOnTop":{},"checkForUpdates":{},"panicHotkey":{}}})",
         s.hybridQpcTimer ? "true" : "false",
         s.disablePowerThrottle ? "true" : "false",
         s.mmcssPriority ? "true" : "false",
@@ -404,6 +412,7 @@ std::string ConfigManager::Serialize(const AppConfig& config) {
         EscapeJson(s.targetProcessName),
         s.minimizeToTray ? "true" : "false",
         s.alwaysOnTop ? "true" : "false",
+        s.checkForUpdates ? "true" : "false",
         WriteHotkey(s.panicHotkey)
     );
 
@@ -451,6 +460,7 @@ bool ConfigManager::Deserialize(const std::string& jsonText, AppConfig& outConfi
         outConfig.settings.targetProcessName    = GetStr(so, "targetProcessName", "");
         outConfig.settings.minimizeToTray       = GetBool(so, "minimizeToTray", true);
         outConfig.settings.alwaysOnTop          = GetBool(so, "alwaysOnTop", false);
+        outConfig.settings.checkForUpdates      = GetBool(so, "checkForUpdates", true);
         outConfig.settings.panicHotkey          = ReadHotkey(so, "panicHotkey", outConfig.settings.panicHotkey);
     }
     if (auto it = o.find("profiles"); it != o.end() && it->second.IsArray()) {

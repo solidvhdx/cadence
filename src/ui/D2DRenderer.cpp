@@ -58,6 +58,18 @@ void D2DRenderer::Shutdown() {
 }
 
 bool D2DRenderer::CreateTextFormats() {
+    auto pickFont = [&](const wchar_t* preferred, const wchar_t* fallback) -> const wchar_t* {
+        ComPtr<IDWriteFontCollection> sysFonts;
+        if (SUCCEEDED(m_dwriteFactory->GetSystemFontCollection(&sysFonts)) && sysFonts) {
+            UINT32 index = 0;
+            BOOL exists  = FALSE;
+            if (SUCCEEDED(sysFonts->FindFamilyName(preferred, &index, &exists)) && exists) {
+                return preferred;
+            }
+        }
+        return fallback;
+    };
+
     auto makeFmt = [&](TextStyle idx, const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight) -> bool {
         ComPtr<IDWriteTextFormat> fmt;
         HRESULT hr = m_dwriteFactory->CreateTextFormat(
@@ -75,8 +87,8 @@ bool D2DRenderer::CreateTextFormats() {
         return true;
     };
 
-    const wchar_t* uiFont   = L"Segoe UI Variable Text";
-    const wchar_t* monoFont = L"Cascadia Mono";
+    const wchar_t* uiFont   = pickFont(L"Segoe UI Variable Text", L"Segoe UI");
+    const wchar_t* monoFont = pickFont(L"Cascadia Mono", L"Consolas");
 
     return makeFmt(TextStyle::Title,      uiFont,   12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD) &&
            makeFmt(TextStyle::Body,       uiFont,   12.0f, DWRITE_FONT_WEIGHT_REGULAR) &&
@@ -249,7 +261,11 @@ void D2DRenderer::DrawRoundedRect(D2D1_RECT_F rc, float radius, D2D1_COLOR_F col
 }
 
 void D2DRenderer::DrawLine(float x1, float y1, float x2, float y2, D2D1_COLOR_F color, float strokeWidth) {
-    m_rt->DrawLine(D2D1::Point2F(x1, y1 + 0.5f), D2D1::Point2F(x2, y2 + 0.5f), Brush(color), strokeWidth);
+    const bool isHorizontal = (std::abs(y1 - y2) < 0.01f);
+    const bool isVertical   = (std::abs(x1 - x2) < 0.01f);
+    const float ox = isVertical   ? 0.5f : 0.0f;
+    const float oy = isHorizontal ? 0.5f : 0.0f;
+    m_rt->DrawLine(D2D1::Point2F(x1 + ox, y1 + oy), D2D1::Point2F(x2 + ox, y2 + oy), Brush(color), strokeWidth);
 }
 
 void D2DRenderer::FillCircle(float cx, float cy, float r, D2D1_COLOR_F color) {

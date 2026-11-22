@@ -25,15 +25,18 @@ public:
     // Sends primary key up, then modifier keys up in reverse order
     bool SendChordUp(uint16_t primaryVk, bool ctrl, bool shift, bool alt, KeyDispatchMethod method) noexcept;
 
-    // Guarantees every key pressed by this engine is cleanly released
-    void ReleaseAll(KeyDispatchMethod method = KeyDispatchMethod::ScanCode) noexcept;
+    // Guarantees every key pressed by this engine is cleanly released using its original dispatch method
+    void ReleaseAll() noexcept;
 
 private:
     static bool  IsExtendedKey(uint16_t vk) noexcept;
     static INPUT BuildKeyInput(uint16_t vk, bool keyUp, KeyDispatchMethod method) noexcept;
+    void         MarkHeld(uint16_t vk, KeyDispatchMethod method) noexcept;
+    void         MarkReleased(uint16_t vk) noexcept;
 
-    // 256-bit atomic mask for VKs 0..255
+    // 256-bit atomic masks for VKs 0..255 (held state + whether VirtualKey dispatch was used)
     std::array<std::atomic<uint64_t>, 4> m_heldBits{};
+    std::array<std::atomic<uint64_t>, 4> m_heldVkMethodBits{};
 };
 
 } // namespace cadence

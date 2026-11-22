@@ -33,12 +33,15 @@ public:
                      const HotkeyBinding& panicHotkey);
 
     // Capture mode for rebinding hotkeys or KPS target key
-    void BeginCapture(bool allowMouseButtons, std::function<void(HotkeyBinding)> onCaptured);
+    void BeginCapture(bool allowMouseButtons,
+                      std::function<void(HotkeyBinding)> onCaptured,
+                      std::function<void()> onCancelled = nullptr);
     void CancelCapture();
     [[nodiscard]] bool IsCapturing() const noexcept { return m_capturing; }
 
     // Global physical Left-Click capture (for multi-monitor Coordinate Pick & Target Window Lock)
-    void BeginGlobalLeftClickCapture(std::function<void(POINT, HWND)> onPicked);
+    void BeginGlobalLeftClickCapture(std::function<void(POINT, HWND)> onPicked,
+                                     std::function<void()> onCancelled = nullptr);
     void CancelLeftClickCapture();
     [[nodiscard]] bool IsPickingLeftClick() const noexcept { return m_pickingLeftClick; }
 
@@ -70,10 +73,12 @@ private:
     bool                               m_capturing         = false;
     bool                               m_captureAllowMouse = true;
     std::function<void(HotkeyBinding)> m_captureCallback;
+    std::function<void()>              m_captureCancelCallback;
 
     // Global physical left-click capture (Coordinate Pick / Target Window Pick)
     bool                             m_pickingLeftClick = false;
     std::function<void(POINT, HWND)> m_leftClickCallback;
+    std::function<void()>            m_leftClickCancelCallback;
 };
 
 } // namespace cadence
