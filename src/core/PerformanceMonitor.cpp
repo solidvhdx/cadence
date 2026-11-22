@@ -30,6 +30,15 @@ PerformanceMonitor::PerformanceMonitor() {
     }
     GetSystemTimeAsFileTime(&now);
     m_prevWallTime100ns = FileTimeToU64(now);
+
+    // Sample initial working set immediately so the footer never displays "0.0 MB" on startup
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                             sizeof(pmc))) {
+        m_lastMemoryMb = static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
+    }
 }
 
 void PerformanceMonitor::RecordEvent(int64_t timestampQpc,

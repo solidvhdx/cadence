@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Cadence VERSION 1.0.1 LANGUAGES CXX)
+project(Cadence VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,11 +30,15 @@ target_compile_options(cadence_compile_options INTERFACE
     /Zc:__cplusplus
     /utf-8
     /EHsc
-    $<$<CONFIG:Release>:/O2;/Oi;/Ot;/GL;/Gw;/Gy;/GS->
+    /GS
+    $<$<CONFIG:Release>:/O2;/Oi;/Ot;/GL;/Gw;/Gy;/guard:cf>
     $<$<CONFIG:Debug>:/Od;/Zi>
 )
 target_link_options(cadence_compile_options INTERFACE
-    $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF>
+    /DYNAMICBASE
+    /NXCOMPAT
+    /HIGHENTROPYVA
+    $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF;/GUARD:CF>
 )
 
 # ---------------------------------------------------------------------------

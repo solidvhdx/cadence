@@ -27,7 +27,8 @@ constexpr wchar_t kWindowClassName[] = L"CadenceMainWindowClass";
 
 std::wstring Utf8ToWide(std::string_view s) {
     if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    const int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (len <= 0) return {};
     std::wstring out(static_cast<size_t>(len), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), len);
     return out;
@@ -35,7 +36,8 @@ std::wstring Utf8ToWide(std::string_view s) {
 
 std::string WideToUtf8(std::wstring_view ws) {
     if (ws.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    const int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
     std::string out(static_cast<size_t>(len), '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), out.data(), len, nullptr, nullptr);
     return out;
@@ -155,8 +157,8 @@ bool MainWindow::IsProcessElevated() noexcept {
 }
 
 void MainWindow::RestartAsAdministrator() {
-    wchar_t exePath[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return;
+    const auto exePath = UpdateChecker::CurrentExePath();
+    if (exePath.empty()) return;
 
     SaveConfigNow();
     m_engine.Stop();
@@ -164,7 +166,7 @@ void MainWindow::RestartAsAdministrator() {
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
     sei.lpVerb = L"runas";
-    sei.lpFile = exePath;
+    sei.lpFile = exePath.c_str();
     sei.nShow  = SW_SHOWNORMAL;
     if (ShellExecuteExW(&sei)) {
         DestroyWindow(m_hwnd);
@@ -186,6 +188,7 @@ HICON MainWindow::CreateAppIcon(int sizePx, uint32_t coreArgb) {
 
     void* bits = nullptr;
     HDC hdc = GetDC(nullptr);
+    if (!hdc) return LoadIconW(nullptr, IDI_APPLICATION);
     HBITMAP hColor = CreateDIBSection(hdc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, hdc);
     if (!hColor || !bits) return LoadIconW(nullptr, IDI_APPLICATION);
@@ -316,6 +319,7 @@ bool MainWindow::Create(HINSTANCE hInstance, bool previewUpdate) {
 
     SyncEngineAndHotkeys();
     SetAlwaysOnTop(m_config.settings.alwaysOnTop);
+    m_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     InitTrayIcon();
 
     m_updateShared = std::make_shared<UpdateShared>();
@@ -333,6 +337,7 @@ bool MainWindow::Create(HINSTANCE hInstance, bool previewUpdate) {
         StartUpdateCheckAsync();
     }
 
+    m_telemetry = m_engine.GetTelemetry();
     ShowWindow(m_hwnd, SW_SHOW);
     UpdateWindow(m_hwnd);
     UpdateTelemetryTimer();
@@ -569,10 +574,38 @@ LRESULT CALLBACK MainWindow::StaticWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 }
 
 LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Recover system tray icon automatically if explorer.exe restarts
+    if (m_msgTaskbarCreated != 0 && msg == m_msgTaskbarCreated) {
+        m_trayAdded = false;
+        InitTrayIcon();
+        UpdateTrayIconState();
+        return 0;
+    }
+
     switch (msg) {
         case WM_NCCALCSIZE:
             if (wParam == TRUE) return 0;
             break;
+
+        case WM_NCLBUTTONDBLCLK:
+            return 0; // Fixed-width layout: never maximize on titlebar double-click
+
+        case WM_SYSCOMMAND: {
+            const UINT cmd = static_cast<UINT>(wParam & 0xFFF0);
+            if (cmd == SC_MAXIMIZE || cmd == SC_SIZE) {
+                return 0; // Prevent Aero Snap maximize or manual border resizing
+            }
+            break;
+        }
+
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            const int pxW = DipToPx(m_widthDip);
+            const int pxH = DipToPx(m_heightDip);
+            mmi->ptMinTrackSize = {pxW, pxH};
+            mmi->ptMaxTrackSize = {pxW, pxH};
+            return 0;
+        }
 
         case WM_NCHITTEST: {
             POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -589,7 +622,15 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DPICHANGED: {
             m_dpi = static_cast<float>(HIWORD(wParam));
-            UpdateWindowSizeForLayout(true);
+            m_heightDip = ComputeDesiredHeightDip();
+            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+            const int pxW = DipToPx(m_widthDip);
+            const int pxH = DipToPx(m_heightDip);
+            SetWindowPos(m_hwnd, nullptr,
+                         suggested ? suggested->left : 0,
+                         suggested ? suggested->top : 0,
+                         pxW, pxH,
+                         (suggested ? 0u : SWP_NOMOVE) | SWP_NOZORDER | SWP_NOACTIVATE);
             RECT rc{};
             GetClientRect(m_hwnd, &rc);
             m_renderer.Resize(static_cast<uint32_t>(std::max(1L, rc.right - rc.left)),
@@ -741,6 +782,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
             HandleLButtonUp();
             return 0;
 
+        case WM_CAPTURECHANGED:
+            if (m_dragSlider != DragSlider::None) {
+                m_dragSlider = DragSlider::None;
+                SaveConfigNow();
+                RequestRender();
+            }
+            return 0;
+
         case WM_MOUSEWHEEL:
             HandleMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
             return 0;
@@ -769,10 +818,19 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            if (m_updateShared) {
+                std::scoped_lock lock(m_updateShared->mtx);
+                m_updateShared->hwnd = nullptr;
+            }
+            m_engine.SetStateChangedCallback(nullptr);
+            m_engine.SetAppWindow(nullptr);
             KillTimer(m_hwnd, kTimerAnim);
             KillTimer(m_hwnd, kTimerTelemetry);
+            RemoveTrayIcon();
+            m_hotkeys.Shutdown();
             m_engine.Stop();
             SaveConfigNow();
+            m_hwnd = nullptr;
             PostQuitMessage(0);
             return 0;
     }
@@ -1638,10 +1696,12 @@ void MainWindow::RenderSettingsTab(float w, float& y) {
         m_engine.Stop();
         m_config = AppConfig{};
         m_profiles = std::make_unique<ProfileManager>(m_config);
+        m_profileScroll = 0;
         SyncEngineAndHotkeys();
         SetAlwaysOnTop(false);
         UpdateWindowSizeForLayout();
         SaveConfigNow();
+        StartAnimTimer();
         RequestRender();
     });
 }
@@ -1724,7 +1784,14 @@ void MainWindow::RenderFooter(float w, float h) {
 void MainWindow::RenderProfilePopover() {
     const auto& list = m_profiles->Profiles();
     const float rowH = 26.0f;
-    const float popH = static_cast<float>(list.size()) * rowH + (m_namingProfile ? 76.0f : 68.0f);
+    const float footerH = m_namingProfile ? 76.0f : 68.0f;
+    const int totalRows = static_cast<int>(list.size());
+    const int maxVisRows = std::max(3, static_cast<int>((m_heightDip - 52.0f - footerH) / rowH));
+    const int visRows = std::min(totalRows, maxVisRows);
+    const int maxScroll = std::max(0, totalRows - visRows);
+    m_profileScroll = std::clamp(m_profileScroll, 0, maxScroll);
+
+    const float popH = static_cast<float>(visRows) * rowH + footerH;
     const float popLeft = std::clamp(m_profileBtnLeft, 88.0f, m_widthDip - 236.0f);
     const D2D1_RECT_F rc{popLeft, 38.0f, popLeft + 222.0f, 38.0f + popH};
 
@@ -1733,14 +1800,17 @@ void MainWindow::RenderProfilePopover() {
     m_renderer.DrawRoundedRect(rc, 9.0f, ThemeTokens::kHairlineStrong);
 
     float py = rc.top + 6.0f;
-    for (size_t i = 0; i < list.size(); ++i) {
+    const float listTop = py;
+    const float rightInset = (maxScroll > 0) ? 10.0f : 6.0f;
+    for (int row = 0; row < visRows; ++row) {
+        const size_t i = static_cast<size_t>(m_profileScroll + row);
         const auto& p = list[i];
         const bool active = (p.id == m_config.activeProfileId);
-        const D2D1_RECT_F r{rc.left + 6.0f, py, rc.right - 28.0f, py + rowH};
+        const D2D1_RECT_F r{rc.left + 6.0f, py, rc.right - (rightInset + 22.0f), py + rowH};
         const std::string id = std::format("prof_{}", i);
 
         if (active || IsHovered(id)) {
-            m_renderer.FillRoundedRect({rc.left + 6.0f, py, rc.right - 6.0f, py + rowH}, 5.0f,
+            m_renderer.FillRoundedRect({rc.left + 6.0f, py, rc.right - rightInset, py + rowH}, 5.0f,
                                        active ? HexColor(0xFFFFFF, 0.08f) : HexColor(0xFFFFFF, 0.04f));
         }
 
@@ -1763,7 +1833,7 @@ void MainWindow::RenderProfilePopover() {
         }, true);
 
         if (list.size() > 1) {
-            const D2D1_RECT_F delRc{rc.right - 26.0f, py + 3.0f, rc.right - 8.0f, py + rowH - 3.0f};
+            const D2D1_RECT_F delRc{rc.right - (rightInset + 20.0f), py + 3.0f, rc.right - (rightInset + 2.0f), py + rowH - 3.0f};
             const std::string delId = std::format("pdel_{}", i);
             m_renderer.DrawText(L"×", delRc, TextStyle::Body, IsHovered(delId) ? ThemeTokens::kDangerHover : ThemeTokens::kTextMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
             RegisterHit(delRc, delId, [this, pid = p.id]() {
@@ -1773,6 +1843,14 @@ void MainWindow::RenderProfilePopover() {
             }, true);
         }
         py += rowH;
+    }
+
+    if (maxScroll > 0) {
+        const float trackH = static_cast<float>(visRows) * rowH;
+        const float thumbH = std::max(16.0f, trackH * (static_cast<float>(visRows) / static_cast<float>(totalRows)));
+        const float thumbT = static_cast<float>(m_profileScroll) / static_cast<float>(maxScroll);
+        const float thumbY = listTop + thumbT * (trackH - thumbH);
+        m_renderer.FillRoundedRect({rc.right - 6.0f, thumbY, rc.right - 3.0f, thumbY + thumbH}, 1.5f, HexColor(0xFFFFFF, 0.22f));
     }
 
     py += 4.0f;
@@ -2066,6 +2144,10 @@ void MainWindow::HandleLButtonDown(float dipX, float dipY) {
         if (PtInRectF(it->rect, dipX, dipY)) {
             hitPopover = it->isPopover || it->id == "profile_btn";
             if (m_editingRate && it->id != "rate_edit") CommitRateEdit();
+            if (m_captureKind != CaptureKind::None &&
+                it->id != "hk_cap" && it->id != "kps_key" && it->id != "seq_add" && it->id != "set_panic") {
+                m_hotkeys.CancelCapture();
+            }
             if (it->isSlider) {
                 m_dragSlider = it->sliderKind;
                 SetCapture(m_hwnd);
@@ -2078,6 +2160,7 @@ void MainWindow::HandleLButtonDown(float dipX, float dipY) {
         }
     }
     if (m_updateModalOpen) return;
+    if (m_captureKind != CaptureKind::None) m_hotkeys.CancelCapture();
     if (m_editingRate) CommitRateEdit();
     if (m_profileOpen && !hitPopover) {
         m_profileOpen   = false;
@@ -2096,7 +2179,13 @@ void MainWindow::HandleLButtonUp() {
 }
 
 void MainWindow::HandleMouseWheel(int delta) {
-    if (m_tab != ViewTab::Controls || m_profileOpen || m_editingRate || m_updateModalOpen) return;
+    if (m_updateModalOpen || m_editingRate) return;
+    if (m_profileOpen) {
+        m_profileScroll += (delta > 0) ? -1 : 1;
+        RequestRender();
+        return;
+    }
+    if (m_tab != ViewTab::Controls) return;
     const double cur  = (m_config.activeMode == OperatingMode::CPS) ? m_config.cps.rateCps : m_config.kps.rateKps;
     const double mag  = (cur >= 50.0) ? 5.0 : 0.5;
     const double step = (delta > 0) ? mag : -mag;
@@ -2166,15 +2255,17 @@ void MainWindow::CommitRateEdit() {
     m_editingRate = false;
     if (!m_rateEditBuf.empty()) {
         try {
-            const double parsed  = std::stod(m_rateEditBuf);
-            const bool isCps     = (m_config.activeMode == OperatingMode::CPS);
-            const bool asMs      = isCps ? m_config.cps.displayAsMs : m_config.kps.displayAsMs;
-            const double rate    = asMs ? (parsed > 0.5 ? 1000.0 / parsed : kMaxRate) : parsed;
-            const double clamped = std::clamp(std::round(rate * 10.0) / 10.0, 0.5, kMaxRate);
-            if (isCps) m_config.cps.rateCps = clamped;
-            else       m_config.kps.rateKps = clamped;
-            SyncEngineAndHotkeys();
-            SaveConfigNow();
+            const double parsed = std::stod(m_rateEditBuf);
+            if (std::isfinite(parsed) && parsed > 0.0) {
+                const bool isCps     = (m_config.activeMode == OperatingMode::CPS);
+                const bool asMs      = isCps ? m_config.cps.displayAsMs : m_config.kps.displayAsMs;
+                const double rate    = asMs ? (parsed > 0.5 ? 1000.0 / parsed : kMaxRate) : parsed;
+                const double clamped = std::clamp(std::round(rate * 10.0) / 10.0, 0.5, kMaxRate);
+                if (isCps) m_config.cps.rateCps = clamped;
+                else       m_config.kps.rateKps = clamped;
+                SyncEngineAndHotkeys();
+                SaveConfigNow();
+            }
         } catch (...) {
         }
     }
@@ -2269,9 +2360,13 @@ void MainWindow::ExportActiveProfileDialog() {
     ofn.lpstrFile   = fileBuf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrDefExt = L"json";
-    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (GetSaveFileNameW(&ofn)) {
-        m_profiles->ExportProfile(m_config.activeProfileId, fileBuf);
+        if (m_profiles->ExportProfile(m_config.activeProfileId, fileBuf)) {
+            ShowToast(L"Profile exported", false);
+        } else {
+            ShowToast(L"Failed to export profile", true);
+        }
     }
 }
 
@@ -2283,13 +2378,16 @@ void MainWindow::ImportProfileDialog() {
     ofn.lpstrFilter = L"JSON Profile (*.json)\0*.json\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile   = fileBuf;
     ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (GetOpenFileNameW(&ofn)) {
         if (m_profiles->ImportProfile(fileBuf)) {
             SyncEngineAndHotkeys();
             UpdateWindowSizeForLayout();
             SaveConfigNow();
-            RequestRender();
+            StartAnimTimer();
+            ShowToast(L"Profile imported", false);
+        } else {
+            ShowToast(L"Invalid profile file", true);
         }
     }
 }

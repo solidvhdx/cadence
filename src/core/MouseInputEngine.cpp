@@ -1,6 +1,7 @@
 #include "core/MouseInputEngine.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace cadence {
 
@@ -29,14 +30,15 @@ DWORD MouseInputEngine::ButtonUpFlag(MouseButton button) noexcept {
 void MouseInputEngine::ApplyAbsoluteVirtualCoords(MOUSEINPUT& mi, int32_t screenX, int32_t screenY) noexcept {
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int vw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
-    const int vh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+    const int vw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    const int vh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
 
-    const double nx = static_cast<double>(screenX - vx) * 65535.0 / static_cast<double>(vw);
-    const double ny = static_cast<double>(screenY - vy) * 65535.0 / static_cast<double>(vh);
+    // Pixel-center mapping avoids off-by-1 truncation in Windows' (dx * vw) >> 16 conversion
+    const double nx = (static_cast<double>(screenX - vx) + 0.5) * 65536.0 / static_cast<double>(vw);
+    const double ny = (static_cast<double>(screenY - vy) + 0.5) * 65536.0 / static_cast<double>(vh);
 
-    mi.dx      = static_cast<LONG>(std::clamp(nx, 0.0, 65535.0));
-    mi.dy      = static_cast<LONG>(std::clamp(ny, 0.0, 65535.0));
+    mi.dx      = static_cast<LONG>(std::clamp(std::floor(nx), 0.0, 65535.0));
+    mi.dy      = static_cast<LONG>(std::clamp(std::floor(ny), 0.0, 65535.0));
     mi.dwFlags |= MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 }
 
@@ -45,14 +47,18 @@ bool MouseInputEngine::SendDown(MouseButton button, CursorMode cursorMode, int32
     UINT count = 0;
 
     if (cursorMode == CursorMode::LockedPoint && microWiggle) {
+        // Move to 1px adjacent pixel then nudge back onto exact (lockX, lockY) so game UI hover fires AND click lands on exact pixel
+        const int vx        = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int32_t preX  = (lockX > vx) ? (lockX - 1) : (lockX + 1);
+        const LONG nudgeDx  = (lockX > vx) ? 1 : -1;
+
         inputs[count].type           = INPUT_MOUSE;
         inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;
-        ApplyAbsoluteVirtualCoords(inputs[count].mi, lockX, lockY);
+        ApplyAbsoluteVirtualCoords(inputs[count].mi, preX, lockY);
         ++count;
 
-        // Subtle relative nudge so game UI hover states (e.g. Roblox GuiButton) trigger reliably
         inputs[count].type           = INPUT_MOUSE;
-        inputs[count].mi.dx          = 1;
+        inputs[count].mi.dx          = nudgeDx;
         inputs[count].mi.dy          = 0;
         inputs[count].mi.dwFlags     = MOUSEEVENTF_MOVE;
         inputs[count].mi.dwExtraInfo = kCadenceInjectedTag;

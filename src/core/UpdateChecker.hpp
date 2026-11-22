@@ -44,6 +44,9 @@ public:
     // Downloads a verified Cadence.exe binary over HTTPS to destPath
     [[nodiscard]] static bool DownloadBinary(const std::string& url, const std::filesystem::path& destPath);
 
+    // Validates that a file on disk is a genuine, non-truncated x64 Windows PE executable (not a DLL)
+    [[nodiscard]] static bool VerifyPe64Binary(const std::filesystem::path& exePath) noexcept;
+
     // Renames running exe -> .old, moves newExePath -> current exe, and spawns updated process with --updated
     [[nodiscard]] static bool ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath);
 

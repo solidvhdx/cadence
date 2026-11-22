@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -80,7 +81,19 @@ int main() {
         cadence::Profile unicodeProf{};
         CADENCE_ASSERT(cadence::ConfigManager::DeserializeProfile(R"({"id":"u1","name":"Pr\u00e4zision","mode":0})", unicodeProf), "Unicode JSON parse");
         CADENCE_ASSERT(unicodeProf.name == "Pr\xC3\xA4zision", "Unicode \\u00e4 decoded to UTF-8 'ä'");
-        std::cout << "[PASS] ConfigManager atomic JSON persistence, Unicode escapes & mode isolation\n";
+
+        // Verify JSON hardening: recursion depth cap & non-finite / out-of-range numbers
+        cadence::AppConfig malformed{};
+        const std::string deepJson = std::string(100, '[') + std::string(100, ']');
+        CADENCE_ASSERT(!cadence::ConfigManager::Deserialize(deepJson, malformed), "Deeply nested JSON (>64 levels) rejected");
+        CADENCE_ASSERT(!cadence::ConfigManager::Deserialize(R"({"activeMode": 1e9999})", malformed), "Non-finite JSON number rejected");
+
+        cadence::AppConfig clamped{};
+        CADENCE_ASSERT(cadence::ConfigManager::Deserialize(R"({"activeMode": -999, "cps": {"burstCount": 999999999999999, "rateCps": -50}})", clamped), "Out-of-range finite JSON numbers parsed safely");
+        CADENCE_ASSERT(clamped.cps.rateCps >= 0.5 && clamped.cps.rateCps <= 500.0, "Out-of-range CPS rate clamped safely");
+        CADENCE_ASSERT(clamped.cps.burstCount >= 2 && clamped.cps.burstCount <= 20, "Out-of-range burstCount clamped safely");
+
+        std::cout << "[PASS] ConfigManager atomic JSON persistence, hardening & mode isolation\n";
     }
 
     // 2. ProfileManager Mode Switching & Non-Destructive Preservation
@@ -147,6 +160,9 @@ int main() {
         cadence::TimingEngine timing;
         cadence::PerformanceMonitor pm;
         const int64_t freq = timing.QpcFrequency();
+        const auto initSnap = pm.ComputeSnapshot(timing.NowQpc(), freq, false);
+        CADENCE_ASSERT(initSnap.memoryMb > 0.0, "Initial memory usage sampled immediately on construction");
+
         int64_t t = timing.NowQpc() - freq; // simulate 1 second of 20 CPS events (50ms each)
         for (int i = 0; i < 20; ++i) {
             t += freq / 20;
@@ -184,6 +200,10 @@ int main() {
         CADENCE_ASSERT(!UpdateChecker::IsNewerVersion("v1.0.0", SemVer{1, 0, 1}), "v1.0.0 < 1.0.1 not newer");
 
         const std::string sampleJson = R"({
+            "author": {
+                "login": "solidvhdx",
+                "html_url": "https://github.com/solidvhdx"
+            },
             "tag_name": "v1.2.0",
             "html_url": "https://github.com/solidvhdx/cadence/releases/tag/v1.2.0",
             "assets": [
@@ -194,8 +214,28 @@ int main() {
         const auto rel = UpdateChecker::ParseGitHubReleaseJson(sampleJson);
         CADENCE_ASSERT(rel.has_value(), "ParseGitHubReleaseJson succeeds");
         CADENCE_ASSERT(rel->tagName == "v1.2.0", "Parsed tag_name");
+        CADENCE_ASSERT(rel->releaseUrl == "https://github.com/solidvhdx/cadence/releases/tag/v1.2.0", "Release html_url ignores earlier author.html_url");
         CADENCE_ASSERT(rel->downloadUrl == "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe", "Extracted Cadence.exe download URL");
-        std::cout << "[PASS] UpdateChecker SemVer & GitHub Release JSON parsing\n";
+
+        // Verify PE64 validation accepts real Cadence.exe and rejects fake/corrupt files
+        const auto selfExe = UpdateChecker::CurrentExePath();
+        const auto siblingCadence = selfExe.parent_path() / L"Cadence.exe";
+        const auto validExe = std::filesystem::exists(siblingCadence) ? siblingCadence : selfExe;
+        CADENCE_ASSERT(UpdateChecker::VerifyPe64Binary(validExe), "VerifyPe64Binary accepts genuine x64 PE executable");
+
+        const auto fakePePath = std::filesystem::temp_directory_path() / L"cadence_unit_test_fake.exe";
+        {
+            std::ofstream fake(fakePePath, std::ios::binary | std::ios::trunc);
+            std::string bogus(70 * 1024, '\0');
+            bogus[0] = 'M';
+            bogus[1] = 'Z';
+            fake.write(bogus.data(), static_cast<std::streamsize>(bogus.size()));
+        }
+        CADENCE_ASSERT(!UpdateChecker::VerifyPe64Binary(fakePePath), "VerifyPe64Binary rejects fake MZ file with invalid PE header");
+        std::error_code rmEc;
+        std::filesystem::remove(fakePePath, rmEc);
+
+        std::cout << "[PASS] UpdateChecker SemVer, GitHub Release JSON & PE64 validation\n";
     }
 
     std::cout << "\nALL TESTS PASSED!\n";

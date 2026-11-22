@@ -7,6 +7,7 @@
 #include <cmath>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <variant>
@@ -42,24 +43,27 @@ public:
 
     bool Parse(JsonValue& out) {
         SkipWs();
-        if (!ParseValue(out)) return false;
+        if (!ParseValue(out, 0)) return false;
         SkipWs();
         return m_pos == m_src.size();
     }
 
 private:
+    static constexpr int kMaxDepth = 64;
+
     void SkipWs() noexcept {
         while (m_pos < m_src.size() && (m_src[m_pos] == ' ' || m_src[m_pos] == '\t' || m_src[m_pos] == '\r' || m_src[m_pos] == '\n')) {
             ++m_pos;
         }
     }
 
-    bool ParseValue(JsonValue& out) {
+    bool ParseValue(JsonValue& out, int depth) {
+        if (depth > kMaxDepth) return false;
         SkipWs();
         if (m_pos >= m_src.size()) return false;
         const char c = m_src[m_pos];
-        if (c == '{') return ParseObject(out);
-        if (c == '[') return ParseArray(out);
+        if (c == '{') return ParseObject(out, depth + 1);
+        if (c == '[') return ParseArray(out, depth + 1);
         if (c == '"') {
             std::string s;
             if (!ParseString(s)) return false;
@@ -73,7 +77,8 @@ private:
         return false;
     }
 
-    bool ParseObject(JsonValue& out) {
+    bool ParseObject(JsonValue& out, int depth) {
+        if (depth > kMaxDepth) return false;
         ++m_pos; // '{'
         JsonObject obj;
         SkipWs();
@@ -90,7 +95,7 @@ private:
             if (m_pos >= m_src.size() || m_src[m_pos] != ':') return false;
             ++m_pos;
             JsonValue val;
-            if (!ParseValue(val)) return false;
+            if (!ParseValue(val, depth)) return false;
             obj.emplace(std::move(key), std::move(val));
             SkipWs();
             if (m_pos >= m_src.size()) return false;
@@ -105,7 +110,8 @@ private:
         return false;
     }
 
-    bool ParseArray(JsonValue& out) {
+    bool ParseArray(JsonValue& out, int depth) {
+        if (depth > kMaxDepth) return false;
         ++m_pos; // '['
         JsonArray arr;
         SkipWs();
@@ -116,7 +122,7 @@ private:
         }
         while (m_pos < m_src.size()) {
             JsonValue val;
-            if (!ParseValue(val)) return false;
+            if (!ParseValue(val, depth)) return false;
             arr.push_back(std::move(val));
             SkipWs();
             if (m_pos >= m_src.size()) return false;
@@ -187,7 +193,7 @@ private:
         }
         double val = 0.0;
         const auto [ptr, ec] = std::from_chars(m_src.data() + start, m_src.data() + m_pos, val);
-        if (ec != std::errc{} || ptr != m_src.data() + m_pos) return false;
+        if (ec != std::errc{} || ptr != m_src.data() + m_pos || !std::isfinite(val)) return false;
         out.data = val;
         return true;
     }
@@ -226,7 +232,11 @@ template <typename T>
 T GetNum(const JsonObject& obj, const std::string& key, T fallback) {
     auto it = obj.find(key);
     if (it != obj.end() && it->second.IsNumber()) {
-        return static_cast<T>(it->second.AsDouble());
+        const double d = it->second.AsDouble();
+        if (!std::isfinite(d)) return fallback;
+        const double lo = static_cast<double>(std::numeric_limits<T>::lowest());
+        const double hi = static_cast<double>(std::numeric_limits<T>::max());
+        return static_cast<T>(std::clamp(d, lo, hi));
     }
     return fallback;
 }
@@ -491,11 +501,18 @@ bool ConfigManager::DeserializeProfile(const std::string& jsonText, Profile& out
 }
 
 bool ConfigManager::LoadFromFile(const std::filesystem::path& path, AppConfig& outConfig) {
+    constexpr uintmax_t kMaxConfigBytes = 2 * 1024 * 1024; // 2 MB cap against memory DoS
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec || sz == 0 || sz > kMaxConfigBytes) return false;
+
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return Deserialize(ss.str(), outConfig);
+    std::string buf(static_cast<size_t>(sz), '\0');
+    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    if (!in && !in.eof()) return false;
+    buf.resize(static_cast<size_t>(in.gcount()));
+    return Deserialize(buf, outConfig);
 }
 
 bool ConfigManager::SaveToFile(const std::filesystem::path& path, const AppConfig& config) {
@@ -510,9 +527,17 @@ bool ConfigManager::SaveToFile(const std::filesystem::path& path, const AppConfi
         const std::string payload = Serialize(config);
         out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
         out.flush();
-        if (!out.good()) return false;
+        if (!out.good()) {
+            out.close();
+            std::filesystem::remove(tmpPath, ec);
+            return false;
+        }
     }
-    return MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+    return true;
 }
 
 } // namespace cadence

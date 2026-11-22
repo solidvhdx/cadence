@@ -157,10 +157,11 @@ private:
     float     m_heightDip       = 488.0f;
     float     m_profileBtnLeft  = 110.0f;
     float     m_profileBtnRight = 200.0f;
-    bool      m_trayAdded       = false;
-    bool      m_inTray          = false;
-    bool      m_trackingMouse   = false;
-    bool      m_isElevated      = false;
+    bool      m_trayAdded          = false;
+    bool      m_inTray             = false;
+    bool      m_trackingMouse      = false;
+    bool      m_isElevated         = false;
+    UINT      m_msgTaskbarCreated  = 0;
 
     // Core subsystems (completely decoupled from UI)
     AppConfig                       m_config{};
@@ -174,6 +175,7 @@ private:
     ViewTab      m_tab          = ViewTab::Controls;
     bool         m_advancedOpen = false;
     bool         m_profileOpen  = false;
+    int          m_profileScroll = 0;
     PickKind     m_pickKind     = PickKind::None;
     CaptureKind  m_captureKind  = CaptureKind::None;
     DragSlider   m_dragSlider   = DragSlider::None;

@@ -462,7 +462,9 @@ void EngineController::RunCpsCycle(const CpsConfig& cfg,
 
         m_mouse.SendDown(cfg.button, cfg.cursorMode, cfg.lockX, cfg.lockY, cfg.lockedMicroWiggle);
         if (holdMs >= 0.25) {
-            m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin);
+            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+                return; // Aborted: WorkerLoop's ReleaseAll() handles clean release without duplicate UP
+            }
         }
         m_mouse.SendUp(cfg.button, cfg.cursorMode, cfg.lockX, cfg.lockY);
 
@@ -537,13 +539,17 @@ void EngineController::RunKpsCycle(const KpsConfig& cfg,
         ++seqIndex;
         m_keyboard.SendKeyDown(vk, cfg.dispatchMethod);
         if (holdMs >= 0.25) {
-            m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin);
+            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+                return;
+            }
         }
         m_keyboard.SendKeyUp(vk, cfg.dispatchMethod);
     } else {
         m_keyboard.SendChordDown(cfg.targetVk, cfg.modCtrl, cfg.modShift, cfg.modAlt, cfg.dispatchMethod);
         if (holdMs >= 0.25) {
-            m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin);
+            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+                return;
+            }
         }
         m_keyboard.SendChordUp(cfg.targetVk, cfg.modCtrl, cfg.modShift, cfg.modAlt, cfg.dispatchMethod);
     }

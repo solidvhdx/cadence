@@ -42,7 +42,12 @@ INPUT KeyboardInputEngine::BuildKeyInput(uint16_t vk, bool keyUp, KeyDispatchMet
     input.ki.dwExtraInfo = kCadenceInjectedTag;
 
     if (method == KeyDispatchMethod::ScanCode) {
-        const HKL layout = GetKeyboardLayout(0);
+        // Use the active foreground window's keyboard layout (not Cadence's worker thread layout)
+        DWORD fgTid = 0;
+        if (HWND fg = GetForegroundWindow()) {
+            fgTid = GetWindowThreadProcessId(fg, nullptr);
+        }
+        const HKL layout = GetKeyboardLayout(fgTid);
         const UINT sc = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, layout);
         if (sc != 0) {
             input.ki.wScan   = static_cast<WORD>(sc & 0xFF);

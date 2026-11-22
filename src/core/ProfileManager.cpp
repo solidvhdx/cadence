@@ -129,12 +129,20 @@ bool ProfileManager::ExportProfile(const std::string& id, const std::filesystem:
 }
 
 bool ProfileManager::ImportProfile(const std::filesystem::path& srcPath) {
+    constexpr uintmax_t kMaxProfileBytes = 2 * 1024 * 1024; // 2 MB cap
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(srcPath, ec);
+    if (ec || sz == 0 || sz > kMaxProfileBytes) return false;
+
     std::ifstream in(srcPath, std::ios::binary);
     if (!in) return false;
-    std::ostringstream ss;
-    ss << in.rdbuf();
+    std::string buf(static_cast<size_t>(sz), '\0');
+    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    if (!in && !in.eof()) return false;
+    buf.resize(static_cast<size_t>(in.gcount()));
+
     Profile imported{};
-    if (!ConfigManager::DeserializeProfile(ss.str(), imported)) {
+    if (!ConfigManager::DeserializeProfile(buf, imported)) {
         return false;
     }
     // Avoid ID collision

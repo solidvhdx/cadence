@@ -1,5 +1,4 @@
 #include "core/HotkeyManager.hpp"
-#include "core/MouseInputEngine.hpp"
 
 #include <vector>
 
@@ -13,6 +12,7 @@ bool HotkeyManager::Initialize(HWND hwnd, HotkeyCallbacks callbacks) {
     m_hwnd      = hwnd;
     m_callbacks = std::move(callbacks);
     m_keyDownState.fill(false);
+    m_keyLastDownMs.fill(0);
 
     // Register both Keyboard and Mouse Raw Input with RIDEV_INPUTSINK (background global input, zero hook latency)
     RAWINPUTDEVICE devices[2]{};
@@ -109,11 +109,20 @@ void HotkeyManager::CancelLeftClickCapture() {
     }
 }
 
+void HotkeyManager::TriggerPanicStop() {
+    const uint64_t nowMs = GetTickCount64();
+    if (nowMs - m_lastPanicMs < 100ULL) {
+        return; // Debounce duplicate WM_INPUT + WM_HOTKEY delivery on the same physical press
+    }
+    m_lastPanicMs = nowMs;
+    if (m_callbacks.onPanicStop) {
+        m_callbacks.onPanicStop();
+    }
+}
+
 void HotkeyManager::ProcessWmHotkey(WPARAM wParam) {
     if (static_cast<int>(wParam) == kPanicHotkeyId && !m_capturing) {
-        if (m_callbacks.onPanicStop) {
-            m_callbacks.onPanicStop();
-        }
+        TriggerPanicStop();
     }
 }
 
@@ -191,10 +200,14 @@ void HotkeyManager::ProcessRawInput(LPARAM lParam) {
 
 void HotkeyManager::HandleKeyTransition(uint16_t vk, bool isDown) {
     if (isDown) {
-        if (m_keyDownState[vk]) {
-            return; // Ignore OS auto-repeat
+        const uint64_t nowMs = GetTickCount64();
+        // Suppress OS typematic auto-repeat while held, but auto-heal if KEY_UP was dropped by UAC/Lock-Screen (>1200ms gap)
+        if (m_keyDownState[vk] && (nowMs - m_keyLastDownMs[vk]) < 1200ULL) {
+            m_keyLastDownMs[vk] = nowMs;
+            return;
         }
-        m_keyDownState[vk] = true;
+        m_keyDownState[vk]  = true;
+        m_keyLastDownMs[vk] = nowMs;
 
         if (m_capturing) {
             if (vk == VK_ESCAPE) {
@@ -240,9 +253,7 @@ void HotkeyManager::HandleMouseTransition(uint16_t mouseVk, bool isDown) {
 
 void HotkeyManager::DispatchBinding(const HotkeyBinding& binding, bool isDown) {
     if (isDown && binding == m_panicBinding) {
-        if (m_callbacks.onPanicStop) {
-            m_callbacks.onPanicStop();
-        }
+        TriggerPanicStop();
         return;
     }
 

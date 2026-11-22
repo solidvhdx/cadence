@@ -6,6 +6,9 @@
 #include <string_view>
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
+    // Harden DLL search order against CWD / Downloads DLL planting
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+
     const std::wstring_view cmdLine = lpCmdLine ? std::wstring_view(lpCmdLine) : std::wstring_view{};
     const bool isRestartAfterUpdate = (cmdLine.find(L"--updated") != std::wstring_view::npos);
     const bool previewUpdateModal   = (cmdLine.find(L"--preview-update") != std::wstring_view::npos);

@@ -58,6 +58,7 @@ private:
     void HandleKeyTransition(uint16_t vk, bool isDown);
     void HandleMouseTransition(uint16_t mouseVk, bool isDown);
     void DispatchBinding(const HotkeyBinding& binding, bool isDown);
+    void TriggerPanicStop();
 
     HWND            m_hwnd = nullptr;
     HotkeyCallbacks m_callbacks{};
@@ -65,9 +66,11 @@ private:
     HotkeyBinding   m_kpsBinding{HotkeySource::Keyboard, VK_F7};
     HotkeyBinding   m_panicBinding{HotkeySource::Keyboard, VK_F12};
     bool            m_panicRegistered = false;
+    uint64_t        m_lastPanicMs     = 0;
 
-    // Tracks physical key-down state to ignore Windows auto-repeat in Raw Input
-    std::array<bool, 256> m_keyDownState{};
+    // Tracks physical key-down state & timestamps to ignore OS auto-repeat while auto-healing dropped KEY_UP (UAC/UIPI)
+    std::array<bool, 256>     m_keyDownState{};
+    std::array<uint64_t, 256> m_keyLastDownMs{};
 
     // Interactive binding capture
     bool                               m_capturing         = false;
