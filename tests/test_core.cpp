@@ -199,7 +199,10 @@ int main() {
         CADENCE_ASSERT(!UpdateChecker::IsNewerVersion("v1.0.1", SemVer{1, 0, 1}), "v1.0.1 == 1.0.1 not newer");
         CADENCE_ASSERT(!UpdateChecker::IsNewerVersion("v1.0.0", SemVer{1, 0, 1}), "v1.0.0 < 1.0.1 not newer");
 
+        const std::string sampleDigest = "37F0F4B7201C021CCB9F0ADB28AD408177668327E1DDB8E8231EEC97E12DCE06";
+        const std::string sampleDigestLower = "37f0f4b7201c021ccb9f0adb28ad408177668327e1ddb8e8231eec97e12dce06";
         const std::string sampleJson = R"({
+            "body": "Decoy text containing \"tag_name\": \"v9.9.9\" and \"browser_download_url\": \"https://evil.example/Cadence.exe\" \uD83D\uDE80",
             "author": {
                 "login": "solidvhdx",
                 "html_url": "https://github.com/solidvhdx"
@@ -207,21 +210,89 @@ int main() {
             "tag_name": "v1.2.0",
             "html_url": "https://github.com/solidvhdx/cadence/releases/tag/v1.2.0",
             "assets": [
-                {"name": "notes.txt", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/notes.txt"},
-                {"name": "Cadence.exe", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe"}
+                {"name": "SHA256SUMS.txt", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/SHA256SUMS.txt"},
+                {"name": "Cadence.exe", "size": 738816, "digest": "sha256:)" + sampleDigest + R"(", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe"}
             ]
         })";
         const auto rel = UpdateChecker::ParseGitHubReleaseJson(sampleJson);
-        CADENCE_ASSERT(rel.has_value(), "ParseGitHubReleaseJson succeeds");
-        CADENCE_ASSERT(rel->tagName == "v1.2.0", "Parsed tag_name");
+        CADENCE_ASSERT(rel.has_value(), "ParseGitHubReleaseJson succeeds with structured parser & surrogate escapes");
+        CADENCE_ASSERT(rel->tagName == "v1.2.0", "Parsed top-level tag_name (ignores body decoy)");
         CADENCE_ASSERT(rel->releaseUrl == "https://github.com/solidvhdx/cadence/releases/tag/v1.2.0", "Release html_url ignores earlier author.html_url");
         CADENCE_ASSERT(rel->downloadUrl == "https://github.com/solidvhdx/cadence/releases/download/v1.2.0/Cadence.exe", "Extracted Cadence.exe download URL");
+        CADENCE_ASSERT(rel->sha256Hex == sampleDigestLower, "Extracted & normalized Cadence.exe SHA-256 digest");
+        CADENCE_ASSERT(rel->assetSize == 738816, "Extracted Cadence.exe asset size");
+
+        // Fail-closed: asset missing SHA-256 digest must leave downloadUrl empty
+        const std::string noDigestJson = R"({
+            "tag_name": "v1.3.0",
+            "html_url": "https://github.com/solidvhdx/cadence/releases/tag/v1.3.0",
+            "assets": [
+                {"name": "Cadence.exe", "browser_download_url": "https://github.com/solidvhdx/cadence/releases/download/v1.3.0/Cadence.exe"}
+            ]
+        })";
+        const auto noDigRel = UpdateChecker::ParseGitHubReleaseJson(noDigestJson);
+        CADENCE_ASSERT(noDigRel.has_value() && noDigRel->downloadUrl.empty() && noDigRel->sha256Hex.empty(),
+                       "Missing asset digest fails closed (refuses direct auto-download)");
+
+        // Verify CNG SHA-256 against NIST "abc" test vector
+        const auto shaTestPath = UpdateChecker::GenerateRandomTempPath(std::filesystem::temp_directory_path());
+        const auto shaTestPath2 = UpdateChecker::GenerateRandomTempPath(std::filesystem::temp_directory_path());
+        CADENCE_ASSERT(!shaTestPath.empty() && !shaTestPath2.empty() && shaTestPath != shaTestPath2,
+                       "GenerateRandomTempPath produces distinct CSPRNG paths");
+        {
+            std::ofstream f(shaTestPath, std::ios::binary | std::ios::trunc);
+            f.write("abc", 3);
+        }
+        const std::string kNistAbcSha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        const auto computedSha = UpdateChecker::ComputeFileSha256(shaTestPath);
+        CADENCE_ASSERT(computedSha && *computedSha == kNistAbcSha256, "CNG SHA-256 matches NIST 'abc' vector");
+        CADENCE_ASSERT(UpdateChecker::VerifyFileSha256(shaTestPath, "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"),
+                       "VerifyFileSha256 normalizes uppercase hex");
+        CADENCE_ASSERT(!UpdateChecker::VerifyFileSha256(shaTestPath, sampleDigestLower),
+                       "VerifyFileSha256 rejects mismatched digest");
+        std::error_code rmEc;
+        std::filesystem::remove(shaTestPath, rmEc);
 
         // Verify PE64 validation accepts real Cadence.exe and rejects fake/corrupt files
         const auto selfExe = UpdateChecker::CurrentExePath();
         const auto siblingCadence = selfExe.parent_path() / L"Cadence.exe";
         const auto validExe = std::filesystem::exists(siblingCadence) ? siblingCadence : selfExe;
         CADENCE_ASSERT(UpdateChecker::VerifyPe64Binary(validExe), "VerifyPe64Binary accepts genuine x64 PE executable");
+
+        // Verify zero-TOCTOU kernel lock invariant:
+        // 1) FILE_SHARE_READ blocks concurrent writers even on a user-writable executable
+        {
+            HANDLE hLock = CreateFileW(validExe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            CADENCE_ASSERT(hLock != INVALID_HANDLE_VALUE, "Open validExe with FILE_SHARE_READ lock");
+            HANDLE hWrite = CreateFileW(validExe.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+            CADENCE_ASSERT(hWrite == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION,
+                           "Concurrent writer blocked with ERROR_SHARING_VIOLATION while FILE_SHARE_READ lock held");
+            CloseHandle(hLock);
+        }
+        // 2) CreateProcessW succeeds while holding FILE_SHARE_READ lock on the target executable
+        {
+            wchar_t sysDir[MAX_PATH]{};
+            const UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
+            CADENCE_ASSERT(sysLen > 0, "GetSystemDirectoryW succeeds");
+            const std::filesystem::path cmdExe = std::filesystem::path(sysDir) / L"cmd.exe";
+            HANDLE hLock = CreateFileW(cmdExe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            CADENCE_ASSERT(hLock != INVALID_HANDLE_VALUE, "Open cmd.exe with FILE_SHARE_READ lock");
+
+            std::wstring cmdLine = L"\"" + cmdExe.wstring() + L"\" /c exit 0";
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            const BOOL spawned = CreateProcessW(cmdExe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE,
+                                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+            CADENCE_ASSERT(spawned != FALSE, "CreateProcessW succeeds while holding zero-TOCTOU FILE_SHARE_READ lock");
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(hLock);
+        }
 
         const auto fakePePath = std::filesystem::temp_directory_path() / L"cadence_unit_test_fake.exe";
         {
@@ -232,18 +303,20 @@ int main() {
             fake.write(bogus.data(), static_cast<std::streamsize>(bogus.size()));
         }
         CADENCE_ASSERT(!UpdateChecker::VerifyPe64Binary(fakePePath), "VerifyPe64Binary rejects fake MZ file with invalid PE header");
-        std::error_code rmEc;
         std::filesystem::remove(fakePePath, rmEc);
 
-        // Verify pre-cancelled DownloadBinary aborts immediately without touching disk or network
+        // Verify pre-cancelled DownloadBinary and invalid-hash DownloadBinary abort immediately
         std::atomic<bool> preCancel{true};
-        const auto cancelPath = std::filesystem::temp_directory_path() / L"cadence_unit_test_cancel.exe";
-        CADENCE_ASSERT(!UpdateChecker::DownloadBinary("https://github.com/solidvhdx/cadence/releases/download/v1.0.3/Cadence.exe",
-                                                      cancelPath, nullptr, &preCancel),
+        const auto cancelPath = UpdateChecker::GenerateRandomTempPath(std::filesystem::temp_directory_path());
+        CADENCE_ASSERT(!UpdateChecker::DownloadBinary("https://github.com/solidvhdx/cadence/releases/download/v1.0.4/Cadence.exe",
+                                                      cancelPath, sampleDigestLower, nullptr, &preCancel),
                        "Pre-cancelled DownloadBinary returns false immediately");
+        CADENCE_ASSERT(!UpdateChecker::DownloadBinary("https://github.com/solidvhdx/cadence/releases/download/v1.0.4/Cadence.exe",
+                                                      cancelPath, "not-a-valid-sha256", nullptr, nullptr),
+                       "DownloadBinary rejects invalid SHA-256 hex before network");
         CADENCE_ASSERT(!std::filesystem::exists(cancelPath), "Cancelled DownloadBinary leaves no file behind");
 
-        std::cout << "[PASS] UpdateChecker SemVer, GitHub Release JSON, PE64 & cancel validation\n";
+        std::cout << "[PASS] UpdateChecker SemVer, structured JSON, CNG SHA-256, PE64 & zero-TOCTOU lock validation\n";
     }
 
     std::cout << "\nALL TESTS PASSED!\n";

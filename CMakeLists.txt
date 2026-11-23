@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Cadence VERSION 1.0.3 LANGUAGES CXX)
+project(Cadence VERSION 1.0.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +9,7 @@ if(NOT MSVC)
     message(FATAL_ERROR "Cadence targets Windows 11 with MSVC (C++23).")
 endif()
 
-# Common C++23 compiler flags and strict diagnostics
+# Common C++23 compiler flags and strict security diagnostics
 add_library(cadence_compile_options INTERFACE)
 target_compile_features(cadence_compile_options INTERFACE cxx_std_23)
 target_compile_definitions(cadence_compile_options INTERFACE
@@ -26,19 +26,23 @@ target_compile_definitions(cadence_compile_options INTERFACE
 )
 target_compile_options(cadence_compile_options INTERFACE
     /W4
+    /WX
+    /sdl
     /permissive-
     /Zc:__cplusplus
     /utf-8
     /EHsc
     /GS
-    $<$<CONFIG:Release>:/O2;/Oi;/Ot;/GL;/Gw;/Gy;/guard:cf>
+    /Qspectre
+    $<$<CONFIG:Release>:/O2;/Oi;/Ot;/GL;/Gw;/Gy;/guard:cf;/guard:ehcont>
     $<$<CONFIG:Debug>:/Od;/Zi>
 )
 target_link_options(cadence_compile_options INTERFACE
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
-    $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF;/GUARD:CF>
+    /CETCOMPAT
+    $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF;/GUARD:CF;/GUARD:EHCONT>
 )
 
 # ---------------------------------------------------------------------------
@@ -46,6 +50,8 @@ target_link_options(cadence_compile_options INTERFACE
 # ---------------------------------------------------------------------------
 add_library(cadence_core STATIC
     src/core/Types.hpp
+    src/core/JsonParser.hpp
+    src/core/JsonParser.cpp
     src/core/TimingEngine.hpp
     src/core/TimingEngine.cpp
     src/core/MouseInputEngine.hpp
@@ -74,6 +80,7 @@ target_link_libraries(cadence_core PUBLIC
     psapi
     shell32
     advapi32
+    bcrypt
     winhttp
 )
 

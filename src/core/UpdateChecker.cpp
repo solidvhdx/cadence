@@ -1,12 +1,14 @@
 #include "core/UpdateChecker.hpp"
+#include "core/JsonParser.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <winhttp.h>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <fstream>
+#include <cmath>
 #include <vector>
 
 #ifndef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
@@ -19,6 +21,13 @@
 namespace cadence {
 
 namespace {
+
+constexpr uint64_t kMinExeBytes = 64 * 1024;
+constexpr uint64_t kMaxExeBytes = 32 * 1024 * 1024;
+
+[[nodiscard]] constexpr bool NtOk(NTSTATUS status) noexcept {
+    return status >= 0;
+}
 
 void EnforceModernTls(HINTERNET session) noexcept {
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
@@ -50,6 +59,61 @@ private:
     HINTERNET m_h = nullptr;
 };
 
+class WinFileHandle {
+public:
+    WinFileHandle() = default;
+    explicit WinFileHandle(HANDLE h) noexcept : m_h(h) {}
+    ~WinFileHandle() { Reset(); }
+
+    WinFileHandle(const WinFileHandle&)            = delete;
+    WinFileHandle& operator=(const WinFileHandle&) = delete;
+
+    void Reset(HANDLE h = INVALID_HANDLE_VALUE) noexcept {
+        if (m_h != INVALID_HANDLE_VALUE && m_h != nullptr) {
+            CloseHandle(m_h);
+        }
+        m_h = h;
+    }
+
+    [[nodiscard]] HANDLE Get() const noexcept { return m_h; }
+    [[nodiscard]] explicit operator bool() const noexcept { return m_h != INVALID_HANDLE_VALUE && m_h != nullptr; }
+
+private:
+    HANDLE m_h = INVALID_HANDLE_VALUE;
+};
+
+class BcryptAlgHandle {
+public:
+    BcryptAlgHandle() = default;
+    ~BcryptAlgHandle() {
+        if (m_h) BCryptCloseAlgorithmProvider(m_h, 0);
+    }
+    BcryptAlgHandle(const BcryptAlgHandle&)            = delete;
+    BcryptAlgHandle& operator=(const BcryptAlgHandle&) = delete;
+
+    BCRYPT_ALG_HANDLE* Put() noexcept { return &m_h; }
+    [[nodiscard]] BCRYPT_ALG_HANDLE Get() const noexcept { return m_h; }
+
+private:
+    BCRYPT_ALG_HANDLE m_h = nullptr;
+};
+
+class BcryptHashHandle {
+public:
+    BcryptHashHandle() = default;
+    ~BcryptHashHandle() {
+        if (m_h) BCryptDestroyHash(m_h);
+    }
+    BcryptHashHandle(const BcryptHashHandle&)            = delete;
+    BcryptHashHandle& operator=(const BcryptHashHandle&) = delete;
+
+    BCRYPT_HASH_HANDLE* Put() noexcept { return &m_h; }
+    [[nodiscard]] BCRYPT_HASH_HANDLE Get() const noexcept { return m_h; }
+
+private:
+    BCRYPT_HASH_HANDLE m_h = nullptr;
+};
+
 std::wstring Utf8ToWide(std::string_view s) {
     if (s.empty()) return {};
     const int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -59,54 +123,167 @@ std::wstring Utf8ToWide(std::string_view s) {
     return out;
 }
 
-// Extracts a JSON string value for a given key starting at offset (handles basic JSON escapes like \/)
-std::optional<std::string> ExtractJsonString(std::string_view json, std::string_view key, size_t startPos = 0, size_t* outEndPos = nullptr) {
-    std::string pattern;
-    pattern.reserve(key.size() + 3);
-    pattern.push_back('"');
-    pattern.append(key);
-    pattern.push_back('"');
+[[nodiscard]] bool ConstantTimeEquals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
 
-    size_t pos = startPos;
-    while ((pos = json.find(pattern, pos)) != std::string_view::npos) {
-        size_t i = pos + pattern.size();
-        while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
-        if (i >= json.size() || json[i] != ':') {
-            pos = i;
-            continue;
+[[nodiscard]] bool IsRegularSingleLinkFile(HANDLE hFile) noexcept {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(hFile, &info)) {
+        return false;
+    }
+    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        return false;
+    }
+    return info.nNumberOfLinks == 1;
+}
+
+[[nodiscard]] bool ReadExactFromHandle(HANDLE hFile, void* dst, DWORD byteCount) noexcept {
+    auto* out = static_cast<unsigned char*>(dst);
+    DWORD total = 0;
+    while (total < byteCount) {
+        DWORD readNow = 0;
+        if (!ReadFile(hFile, out + total, byteCount - total, &readNow, nullptr) || readNow == 0) {
+            return false;
         }
-        ++i;
-        while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
-        if (i >= json.size() || json[i] != '"') {
-            pos = i;
-            continue;
+        total += readNow;
+    }
+    return true;
+}
+
+[[nodiscard]] bool WriteAllToHandle(HANDLE hFile, const void* src, DWORD byteCount) noexcept {
+    const auto* in = static_cast<const unsigned char*>(src);
+    DWORD total = 0;
+    while (total < byteCount) {
+        DWORD written = 0;
+        if (!WriteFile(hFile, in + total, byteCount - total, &written, nullptr) || written == 0) {
+            return false;
         }
-        ++i;
-        std::string value;
-        while (i < json.size()) {
-            const char c = json[i++];
-            if (c == '"') {
-                if (outEndPos) *outEndPos = i;
-                return value;
+        total += written;
+    }
+    return true;
+}
+
+[[nodiscard]] std::optional<std::string> ComputeSha256FromHandle(HANDLE hFile) noexcept {
+    try {
+        LARGE_INTEGER zero{};
+        if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) {
+            return std::nullopt;
+        }
+
+        BcryptAlgHandle alg;
+        if (!NtOk(BCryptOpenAlgorithmProvider(alg.Put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+            return std::nullopt;
+        }
+
+        DWORD objLen = 0;
+        DWORD cbData = 0;
+        if (!NtOk(BCryptGetProperty(alg.Get(), BCRYPT_OBJECT_LENGTH,
+                                    reinterpret_cast<PUCHAR>(&objLen), sizeof(objLen), &cbData, 0)) ||
+            objLen == 0) {
+            return std::nullopt;
+        }
+
+        DWORD hashLen = 0;
+        if (!NtOk(BCryptGetProperty(alg.Get(), BCRYPT_HASH_LENGTH,
+                                    reinterpret_cast<PUCHAR>(&hashLen), sizeof(hashLen), &cbData, 0)) ||
+            hashLen != 32) {
+            return std::nullopt;
+        }
+
+        std::vector<unsigned char> hashObj(objLen);
+        BcryptHashHandle hash;
+        if (!NtOk(BCryptCreateHash(alg.Get(), hash.Put(), hashObj.data(), objLen, nullptr, 0, 0))) {
+            return std::nullopt;
+        }
+
+        std::array<unsigned char, 65536> buf{};
+        for (;;) {
+            DWORD readNow = 0;
+            if (!ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &readNow, nullptr)) {
+                return std::nullopt;
             }
-            if (c == '\\' && i < json.size()) {
-                const char esc = json[i++];
-                switch (esc) {
-                    case '"':  value.push_back('"'); break;
-                    case '\\': value.push_back('\\'); break;
-                    case '/':  value.push_back('/'); break;
-                    case 'n':  value.push_back('\n'); break;
-                    case 'r':  value.push_back('\r'); break;
-                    case 't':  value.push_back('\t'); break;
-                    default:   value.push_back(esc); break;
-                }
-            } else {
-                value.push_back(c);
+            if (readNow == 0) {
+                break;
+            }
+            if (!NtOk(BCryptHashData(hash.Get(), buf.data(), readNow, 0))) {
+                return std::nullopt;
             }
         }
+
+        std::array<unsigned char, 32> digest{};
+        if (!NtOk(BCryptFinishHash(hash.Get(), digest.data(), static_cast<ULONG>(digest.size()), 0))) {
+            return std::nullopt;
+        }
+
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(64);
+        for (unsigned char b : digest) {
+            hex.push_back(kHex[b >> 4]);
+            hex.push_back(kHex[b & 0x0F]);
+        }
+        return hex;
+    } catch (...) {
         return std::nullopt;
     }
-    return std::nullopt;
+}
+
+[[nodiscard]] bool VerifyPe64FromHandle(HANDLE hFile) noexcept {
+    LARGE_INTEGER fileSizeLi{};
+    if (!GetFileSizeEx(hFile, &fileSizeLi) || fileSizeLi.QuadPart <= 0) {
+        return false;
+    }
+    const uint64_t fileSize = static_cast<uint64_t>(fileSizeLi.QuadPart);
+    if (fileSize < kMinExeBytes || fileSize > kMaxExeBytes) {
+        return false;
+    }
+
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) {
+        return false;
+    }
+
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadExactFromHandle(hFile, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+    if (dos.e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) {
+        return false;
+    }
+    const uint64_t peOffset = static_cast<uint64_t>(dos.e_lfanew);
+    if (peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > fileSize) {
+        return false;
+    }
+
+    LARGE_INTEGER seekPos{};
+    seekPos.QuadPart = static_cast<LONGLONG>(peOffset);
+    if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) {
+        return false;
+    }
+
+    DWORD peSig = 0;
+    IMAGE_FILE_HEADER coff{};
+    if (!ReadExactFromHandle(hFile, &peSig, sizeof(peSig)) ||
+        !ReadExactFromHandle(hFile, &coff, sizeof(coff))) {
+        return false;
+    }
+    if (peSig != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+    if (coff.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        return false;
+    }
+    if ((coff.Characteristics & IMAGE_FILE_DLL) != 0 ||
+        (coff.Characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0) {
+        return false;
+    }
+    return true;
 }
 
 bool HttpGetToBuffer(const std::wstring& host,
@@ -216,47 +393,139 @@ bool UpdateChecker::IsNewerVersion(std::string_view candidateTag, SemVer current
     return *parsed > current;
 }
 
-std::optional<ReleaseInfo> UpdateChecker::ParseGitHubReleaseJson(std::string_view json) {
-    const auto tag = ExtractJsonString(json, "tag_name");
-    if (!tag) return std::nullopt;
+std::optional<std::string> UpdateChecker::NormalizeSha256Hex(std::string_view hex) noexcept {
+    if (hex.size() != 64) return std::nullopt;
+    try {
+        std::string norm;
+        norm.reserve(64);
+        for (char c : hex) {
+            if (c >= '0' && c <= '9') {
+                norm.push_back(c);
+            } else if (c >= 'a' && c <= 'f') {
+                norm.push_back(c);
+            } else if (c >= 'A' && c <= 'F') {
+                norm.push_back(static_cast<char>(c - 'A' + 'a'));
+            } else {
+                return std::nullopt;
+            }
+        }
+        return norm;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 
-    const auto ver = ParseSemVer(*tag);
+std::optional<std::string> UpdateChecker::ComputeFileSha256(const std::filesystem::path& filePath) noexcept {
+    WinFileHandle fh(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!fh || !IsRegularSingleLinkFile(fh.Get())) {
+        return std::nullopt;
+    }
+    return ComputeSha256FromHandle(fh.Get());
+}
+
+bool UpdateChecker::VerifyFileSha256(const std::filesystem::path& filePath, std::string_view expectedHex) noexcept {
+    const auto norm = NormalizeSha256Hex(expectedHex);
+    if (!norm) return false;
+    const auto actual = ComputeFileSha256(filePath);
+    if (!actual) return false;
+    return ConstantTimeEquals(*actual, *norm);
+}
+
+std::filesystem::path UpdateChecker::GenerateRandomTempPath(const std::filesystem::path& targetDir) {
+    if (targetDir.empty()) return {};
+    static constexpr wchar_t kHexW[] = L"0123456789abcdef";
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::array<unsigned char, 8> rnd{};
+        if (!NtOk(BCryptGenRandom(nullptr, rnd.data(), static_cast<ULONG>(rnd.size()),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+            return {};
+        }
+        std::wstring suffix;
+        suffix.reserve(16);
+        for (unsigned char b : rnd) {
+            suffix.push_back(kHexW[b >> 4]);
+            suffix.push_back(kHexW[b & 0x0F]);
+        }
+        std::filesystem::path cand = targetDir / (L"Cadence.upd." + suffix + L".tmp");
+        // Reject any pre-existing file, directory, symlink, or reparse point at candidate path
+        if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            GetLastError() == ERROR_FILE_NOT_FOUND) {
+            return cand;
+        }
+    }
+    return {};
+}
+
+std::optional<ReleaseInfo> UpdateChecker::ParseGitHubReleaseJson(std::string_view json) {
+    JsonValue root;
+    JsonParser parser(json);
+    if (!parser.Parse(root) || !root.IsObject()) {
+        return std::nullopt;
+    }
+
+    const JsonValue* tagVal = root.Find("tag_name");
+    if (!tagVal || !tagVal->IsString()) return std::nullopt;
+
+    const auto ver = ParseSemVer(tagVal->AsString());
     if (!ver) return std::nullopt;
 
     ReleaseInfo info{};
-    info.tagName = *tag;
+    info.tagName = tagVal->AsString();
     info.version = *ver;
 
-    // Find the release html_url (order-independent even if author.html_url appears earlier)
-    {
-        size_t searchPos = 0;
-        while (true) {
-            size_t endPos = 0;
-            const auto htmlUrl = ExtractJsonString(json, "html_url", searchPos, &endPos);
-            if (!htmlUrl) break;
-            if (htmlUrl->starts_with("https://github.com/solidvhdx/cadence/releases/")) {
-                info.releaseUrl = *htmlUrl;
-                break;
-            }
-            searchPos = endPos;
-        }
-    }
-    if (info.releaseUrl.empty()) {
+    const JsonValue* htmlVal = root.Find("html_url");
+    if (htmlVal && htmlVal->IsString() &&
+        htmlVal->AsString().starts_with("https://github.com/solidvhdx/cadence/releases/")) {
+        info.releaseUrl = htmlVal->AsString();
+    } else {
         info.releaseUrl = "https://github.com/solidvhdx/cadence/releases/latest";
     }
 
-    // Find the Cadence.exe download URL inside the assets array
-    size_t searchPos = 0;
-    while (true) {
-        size_t endPos = 0;
-        const auto dlUrl = ExtractJsonString(json, "browser_download_url", searchPos, &endPos);
-        if (!dlUrl) break;
-        if (dlUrl->starts_with("https://github.com/solidvhdx/cadence/releases/download/") &&
-            dlUrl->ends_with("/Cadence.exe")) {
-            info.downloadUrl = *dlUrl;
+    // Structurally locate the exact "Cadence.exe" asset and require its SHA-256 digest
+    const JsonValue* assetsVal = root.Find("assets");
+    if (assetsVal && assetsVal->IsArray()) {
+        for (const auto& item : assetsVal->AsArray()) {
+            if (!item.IsObject()) continue;
+            const JsonValue* nameVal = item.Find("name");
+            if (!nameVal || !nameVal->IsString() || nameVal->AsString() != "Cadence.exe") {
+                continue;
+            }
+
+            const JsonValue* dlVal     = item.Find("browser_download_url");
+            const JsonValue* digestVal = item.Find("digest");
+            if (!dlVal || !dlVal->IsString() || !digestVal || !digestVal->IsString()) {
+                break; // Fail closed: never auto-download an asset without a SHA-256 digest
+            }
+
+            const std::string& dlUrl = dlVal->AsString();
+            const std::string& dig   = digestVal->AsString();
+            if (!dlUrl.starts_with("https://github.com/solidvhdx/cadence/releases/download/") ||
+                !dlUrl.ends_with("/Cadence.exe") ||
+                !dig.starts_with("sha256:")) {
+                break;
+            }
+
+            const auto normSha = NormalizeSha256Hex(std::string_view(dig).substr(7));
+            if (!normSha) {
+                break;
+            }
+
+            info.downloadUrl = dlUrl;
+            info.sha256Hex   = *normSha;
+
+            const JsonValue* sizeVal = item.Find("size");
+            if (sizeVal && sizeVal->IsNumber()) {
+                const double sz = sizeVal->AsDouble();
+                if (std::isfinite(sz) && sz >= static_cast<double>(kMinExeBytes) &&
+                    sz <= static_cast<double>(kMaxExeBytes)) {
+                    info.assetSize = static_cast<uint64_t>(sz);
+                }
+            }
             break;
         }
-        searchPos = endPos;
     }
 
     return info;
@@ -281,13 +550,22 @@ std::optional<ReleaseInfo> UpdateChecker::CheckForUpdate() {
 
 bool UpdateChecker::DownloadBinary(const std::string& url,
                                    const std::filesystem::path& destPath,
+                                   std::string_view expectedSha256Hex,
                                    const DownloadProgressCallback& onProgress,
                                    const std::atomic<bool>* cancelFlag) {
     auto isCancelled = [&]() noexcept -> bool {
         return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
     };
 
-    if (isCancelled() || !url.starts_with("https://github.com/solidvhdx/cadence/releases/download/")) {
+    const auto expectedSha = NormalizeSha256Hex(expectedSha256Hex);
+    if (!expectedSha || isCancelled() || destPath.empty() ||
+        !url.starts_with("https://github.com/solidvhdx/cadence/releases/download/") ||
+        !url.ends_with("/Cadence.exe")) {
+        return false;
+    }
+
+    // Refuse pre-existing files or pre-planted symlinks / reparse points
+    if (GetFileAttributesW(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
         return false;
     }
 
@@ -347,8 +625,6 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
         return false;
     }
 
-    constexpr size_t kMaxExeBytes = 32 * 1024 * 1024;
-
     // Query optional Content-Length header so truncated downloads are always rejected
     std::optional<uint64_t> expectedContentLength;
     {
@@ -374,49 +650,61 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
         onProgress(0, totalExpected);
     }
 
-    auto cleanupFail = [&](std::ofstream& f) -> bool {
-        if (f.is_open()) f.close();
+    // Create destination exclusively (CREATE_NEW, share mode 0, never follow reparse points)
+    WinFileHandle outFile(CreateFileW(destPath.c_str(),
+                                      GENERIC_READ | GENERIC_WRITE,
+                                      0,
+                                      nullptr,
+                                      CREATE_NEW,
+                                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                                      nullptr));
+    if (!outFile) {
+        return false;
+    }
+
+    auto cleanupFail = [&]() -> bool {
+        outFile.Reset();
         std::error_code ec;
         std::filesystem::remove(destPath, ec);
         return false;
     };
 
-    std::ofstream out(destPath, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
+    if (!IsRegularSingleLinkFile(outFile.Get())) {
+        return cleanupFail();
+    }
 
-    std::array<char, 16384> buf{};
+    std::array<unsigned char, 16384> buf{};
     uint64_t totalBytes = 0;
 
     for (;;) {
         if (isCancelled()) {
-            return cleanupFail(out);
+            return cleanupFail();
         }
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(request.Get(), &avail)) {
-            return cleanupFail(out); // Mid-stream network error: never accept partial binary!
+            return cleanupFail(); // Mid-stream network error: never accept partial binary!
         }
         if (avail == 0) {
             break; // Clean EOF
         }
         while (avail > 0) {
             if (isCancelled()) {
-                return cleanupFail(out);
+                return cleanupFail();
             }
             const DWORD toRead = static_cast<DWORD>(std::min<size_t>(avail, buf.size()));
             DWORD read = 0;
             if (!WinHttpReadData(request.Get(), buf.data(), toRead, &read)) {
-                return cleanupFail(out);
+                return cleanupFail();
             }
             if (read == 0) {
                 break;
             }
             totalBytes += read;
             if (totalBytes > kMaxExeBytes) {
-                return cleanupFail(out);
+                return cleanupFail();
             }
-            out.write(buf.data(), static_cast<std::streamsize>(read));
-            if (!out.good()) {
-                return cleanupFail(out);
+            if (!WriteAllToHandle(outFile.Get(), buf.data(), read)) {
+                return cleanupFail();
             }
             avail -= read;
             if (onProgress) {
@@ -424,69 +712,35 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
             }
         }
     }
-    out.flush();
-    if (!out.good() || isCancelled()) {
-        return cleanupFail(out);
-    }
-    out.close();
 
-    // Verify Content-Length match (if server provided one) AND valid x64 PE executable structure
+    if (isCancelled() || !FlushFileBuffers(outFile.Get())) {
+        return cleanupFail();
+    }
     if (expectedContentLength && totalBytes != *expectedContentLength) {
-        std::error_code ec;
-        std::filesystem::remove(destPath, ec);
-        return false;
+        return cleanupFail();
     }
-    if (!VerifyPe64Binary(destPath)) {
-        std::error_code ec;
-        std::filesystem::remove(destPath, ec);
-        return false;
+
+    // Verify both cryptographic SHA-256 and x64 PE64 structure on the SAME exclusive handle before closing
+    const auto actualSha = ComputeSha256FromHandle(outFile.Get());
+    if (!actualSha || !ConstantTimeEquals(*actualSha, *expectedSha)) {
+        return cleanupFail();
     }
+    if (!VerifyPe64FromHandle(outFile.Get())) {
+        return cleanupFail();
+    }
+
+    outFile.Reset();
     return true;
 }
 
 bool UpdateChecker::VerifyPe64Binary(const std::filesystem::path& exePath) noexcept {
-    try {
-        std::error_code ec;
-        const auto fileSize = std::filesystem::file_size(exePath, ec);
-        if (ec || fileSize < 64 * 1024 || fileSize > 32 * 1024 * 1024) {
-            return false;
-        }
-
-        std::ifstream in(exePath, std::ios::binary);
-        if (!in) return false;
-
-        IMAGE_DOS_HEADER dos{};
-        in.read(reinterpret_cast<char*>(&dos), sizeof(dos));
-        if (!in || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-            return false;
-        }
-        if (dos.e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER))) {
-            return false;
-        }
-        const uint64_t peOffset = static_cast<uint64_t>(dos.e_lfanew);
-        if (peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > fileSize) {
-            return false;
-        }
-
-        in.seekg(static_cast<std::streamoff>(peOffset), std::ios::beg);
-        DWORD peSig = 0;
-        IMAGE_FILE_HEADER coff{};
-        in.read(reinterpret_cast<char*>(&peSig), sizeof(peSig));
-        in.read(reinterpret_cast<char*>(&coff), sizeof(coff));
-        if (!in || peSig != IMAGE_NT_SIGNATURE) {
-            return false;
-        }
-        if (coff.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            return false;
-        }
-        if ((coff.Characteristics & IMAGE_FILE_DLL) != 0 ||
-            (coff.Characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0) {
-            return false;
-        }
-        return true;
-    } catch (...) {
+    WinFileHandle fh(CreateFileW(exePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!fh || !IsRegularSingleLinkFile(fh.Get())) {
         return false;
     }
+    return VerifyPe64FromHandle(fh.Get());
 }
 
 std::filesystem::path UpdateChecker::CurrentExePath() {
@@ -516,7 +770,13 @@ void UpdateChecker::CleanupOldBinary() noexcept {
     }
 }
 
-bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath) {
+bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath,
+                                           std::string_view expectedSha256Hex) {
+    const auto expectedSha = NormalizeSha256Hex(expectedSha256Hex);
+    if (!expectedSha) {
+        return false;
+    }
+
     auto moveWithRetry = [](const std::filesystem::path& from, const std::filesystem::path& to) -> bool {
         for (int attempt = 0; attempt < 12; ++attempt) {
             if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
@@ -531,9 +791,15 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
         return false;
     };
 
+    const DWORD newAttrs = GetFileAttributesW(newExePath.c_str());
+    if (newAttrs == INVALID_FILE_ATTRIBUTES ||
+        (newAttrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        return false;
+    }
+
     std::error_code ec;
     const auto curExe = CurrentExePath();
-    if (curExe.empty() || !std::filesystem::exists(newExePath, ec)) {
+    if (curExe.empty()) {
         return false;
     }
 
@@ -554,18 +820,44 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
         return false;
     }
 
+    // Zero-TOCTOU lock: open the final binary with GENERIC_READ + FILE_SHARE_READ only (blocks all
+    // concurrent writes, renames, and deletes), re-verify SHA-256 + PE64 from this handle, and hold
+    // the handle open across CreateProcessW so the image cannot be swapped between check and launch.
+    WinFileHandle lockedExe(CreateFileW(curExe.c_str(),
+                                        GENERIC_READ,
+                                        FILE_SHARE_READ,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                                        nullptr));
+    bool verified = false;
+    if (lockedExe && IsRegularSingleLinkFile(lockedExe.Get()) && VerifyPe64FromHandle(lockedExe.Get())) {
+        const auto finalSha = ComputeSha256FromHandle(lockedExe.Get());
+        verified = finalSha && ConstantTimeEquals(*finalSha, *expectedSha);
+    }
+
+    if (!verified) {
+        lockedExe.Reset();
+        std::filesystem::remove(curExe, ec);
+        moveWithRetry(oldExe, curExe);
+        return false;
+    }
+
     std::wstring cmdLine = L"\"" + curExe.wstring() + L"\" --updated";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(curExe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        lockedExe.Reset();
         // Roll back if the new binary failed to launch
         moveWithRetry(curExe, newExePath);
         moveWithRetry(oldExe, curExe);
         return false;
     }
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    lockedExe.Reset();
     return true;
 }
 

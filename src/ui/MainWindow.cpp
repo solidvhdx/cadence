@@ -2168,7 +2168,7 @@ void MainWindow::CancelUpdateDownload() {
 void MainWindow::StartUpdateDownloadAsync() {
     if (!m_availableUpdate || m_updateDownloading) return;
 
-    if (m_availableUpdate->downloadUrl.empty()) {
+    if (m_availableUpdate->downloadUrl.empty() || m_availableUpdate->sha256Hex.empty()) {
         const std::wstring url = Utf8ToWide(m_availableUpdate->releaseUrl);
         ShellExecuteW(m_hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         m_updateModalOpen = false;
@@ -2179,10 +2179,17 @@ void MainWindow::StartUpdateDownloadAsync() {
     auto shared = m_updateShared;
     if (!shared) return;
 
-    const std::string dlUrl = m_availableUpdate->downloadUrl;
-    std::filesystem::path dest = UpdateChecker::CurrentExePath();
-    if (dest.empty()) {
+    const std::string dlUrl       = m_availableUpdate->downloadUrl;
+    const std::string expectedSha = m_availableUpdate->sha256Hex;
+    const std::filesystem::path curExe = UpdateChecker::CurrentExePath();
+    if (curExe.empty()) {
         ShowToast(L"Could not locate current executable", true);
+        return;
+    }
+
+    const std::filesystem::path dest = UpdateChecker::GenerateRandomTempPath(curExe.parent_path());
+    if (dest.empty()) {
+        ShowToast(L"Could not allocate secure temp path", true);
         return;
     }
 
@@ -2191,7 +2198,6 @@ void MainWindow::StartUpdateDownloadAsync() {
     SaveConfigNow();
 
     const uint64_t attempt = ++m_updateAttemptId;
-    dest += L".new." + std::to_wstring(attempt);
 
     auto cancelToken = std::make_shared<std::atomic<bool>>(false);
     m_updateCancelToken = cancelToken;
@@ -2207,7 +2213,7 @@ void MainWindow::StartUpdateDownloadAsync() {
     StartAnimTimer();
     RequestRender();
 
-    std::thread([shared, cancelToken, dlUrl, dest, attempt]() {
+    std::thread([shared, cancelToken, dlUrl, expectedSha, dest, attempt]() {
         auto isStaleOrCancelled = [&]() noexcept -> bool {
             return cancelToken->load(std::memory_order_acquire) ||
                    shared->attemptId.load(std::memory_order_acquire) != attempt;
@@ -2216,6 +2222,7 @@ void MainWindow::StartUpdateDownloadAsync() {
         const bool dlOk = UpdateChecker::DownloadBinary(
             dlUrl,
             dest,
+            expectedSha,
             [shared, attempt](uint64_t dl, uint64_t tot) {
                 if (shared->attemptId.load(std::memory_order_acquire) != attempt) return;
                 shared->bytesDownloaded.store(dl, std::memory_order_relaxed);
@@ -2231,8 +2238,8 @@ void MainWindow::StartUpdateDownloadAsync() {
             outcome = UpdateOutcome::Cancelled;
         } else if (dlOk) {
             shared->stage.store(static_cast<uint8_t>(UpdateStage::Installing), std::memory_order_release);
-            // Run file swap + CreateProcessW OFF the UI thread so Defender/SmartScreen scans never freeze the window!
-            if (UpdateChecker::ApplyUpdateAndRelaunch(dest)) {
+            // Run file swap + locked SHA-256/PE64 re-check + CreateProcessW OFF the UI thread!
+            if (UpdateChecker::ApplyUpdateAndRelaunch(dest, expectedSha)) {
                 outcome = UpdateOutcome::Applied;
             } else {
                 std::error_code ec;
