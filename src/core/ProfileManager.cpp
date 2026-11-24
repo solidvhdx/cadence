@@ -128,8 +128,8 @@ bool ProfileManager::ExportProfile(const std::string& id, const std::filesystem:
     return out.good();
 }
 
-bool ProfileManager::ImportProfile(const std::filesystem::path& srcPath) {
-    constexpr uintmax_t kMaxProfileBytes = 2 * 1024 * 1024; // 2 MB cap
+bool ProfileManager::ReadProfileFile(const std::filesystem::path& srcPath, Profile& outProfile) {
+    constexpr uintmax_t kMaxProfileBytes = 64 * 1024; // A single profile is well under 2 KB
     std::error_code ec;
     const auto sz = std::filesystem::file_size(srcPath, ec);
     if (ec || sz == 0 || sz > kMaxProfileBytes) return false;
@@ -141,17 +141,30 @@ bool ProfileManager::ImportProfile(const std::filesystem::path& srcPath) {
     if (!in && !in.eof()) return false;
     buf.resize(static_cast<size_t>(in.gcount()));
 
-    Profile imported{};
-    if (!ConfigManager::DeserializeProfile(buf, imported)) {
+    Profile parsed{};
+    if (!ConfigManager::DeserializeProfile(buf, parsed)) {
         return false;
     }
-    // Avoid ID collision
-    if (FindById(imported.id)) {
+    outProfile = std::move(parsed);
+    return true;
+}
+
+std::string ProfileManager::AddImportedProfile(Profile imported) {
+    // Avoid ID collision (and never keep an empty ID)
+    if (imported.id.empty() || FindById(imported.id)) {
         const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
         imported.id = std::format("imp-{:x}", static_cast<uint64_t>(ts));
     }
-    m_config.profiles.push_back(imported);
-    ActivateProfile(m_config.profiles.back().id);
+    m_config.profiles.push_back(std::move(imported));
+    return m_config.profiles.back().id;
+}
+
+bool ProfileManager::ImportProfile(const std::filesystem::path& srcPath) {
+    Profile imported{};
+    if (!ReadProfileFile(srcPath, imported)) {
+        return false;
+    }
+    ActivateProfile(AddImportedProfile(std::move(imported)));
     return true;
 }
 

@@ -94,6 +94,9 @@ struct CpsConfig {
     uint32_t        limitValue        = 500;
 };
 
+// Maximum keys in a KPS sequence (enforced by the UI and when loading configs / imported profiles)
+inline constexpr std::size_t kMaxSequenceKeys = 12;
+
 struct KpsConfig {
     double            rateKps         = 10.0;
     bool              displayAsMs     = false;

@@ -121,8 +121,10 @@ void ReadCps(const JsonObject& o, CpsConfig& c) {
     c.activation        = static_cast<ActivationMode>(std::clamp(GetNum<int>(o, "activation", 0), 0, 1));
     c.hotkey            = ReadHotkey(o, "hotkey", c.hotkey);
     c.cursorMode        = static_cast<CursorMode>(std::clamp(GetNum<int>(o, "cursorMode", 0), 0, 1));
-    c.lockX             = GetNum<int32_t>(o, "lockX", c.lockX);
-    c.lockY             = GetNum<int32_t>(o, "lockY", c.lockY);
+    // Keep coordinates far inside int32 range so screen-space math can never overflow
+    constexpr int32_t kCoordLimit = 1'000'000;
+    c.lockX             = std::clamp(GetNum<int32_t>(o, "lockX", c.lockX), -kCoordLimit, kCoordLimit);
+    c.lockY             = std::clamp(GetNum<int32_t>(o, "lockY", c.lockY), -kCoordLimit, kCoordLimit);
     c.lockedMicroWiggle = GetBool(o, "lockedMicroWiggle", c.lockedMicroWiggle);
     c.limitMode         = static_cast<RepeatLimitMode>(std::clamp(GetNum<int>(o, "limitMode", 0), 0, 2));
     c.limitValue        = std::clamp(GetNum<uint32_t>(o, "limitValue", c.limitValue), 1u, 1000000u);
@@ -169,9 +171,11 @@ void ReadKps(const JsonObject& o, KpsConfig& k) {
     if (auto it = o.find("sequenceVks"); it != o.end() && it->second.IsArray()) {
         std::vector<uint16_t> seq;
         for (const auto& item : it->second.AsArray()) {
+            if (seq.size() >= kMaxSequenceKeys) break; // Same limit as the UI
             if (item.IsNumber()) {
-                const int vk = static_cast<int>(item.AsDouble());
-                if (vk >= 1 && vk <= 254) seq.push_back(static_cast<uint16_t>(vk));
+                // Range-check the double BEFORE converting (out-of-range float->int casts are UB)
+                const double d = item.AsDouble();
+                if (d >= 1.0 && d <= 254.0) seq.push_back(static_cast<uint16_t>(d));
             }
         }
         if (!seq.empty()) k.sequenceVks = std::move(seq);

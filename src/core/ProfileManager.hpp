@@ -30,6 +30,14 @@ public:
     bool DeleteProfile(const std::string& id);
 
     bool ExportProfile(const std::string& id, const std::filesystem::path& destPath) const;
+
+    // Reads and validates a profile file WITHOUT adding it, so the UI can show a preview first
+    [[nodiscard]] static bool ReadProfileFile(const std::filesystem::path& srcPath, Profile& outProfile);
+
+    // Adds an already validated profile (new id on collision) without activating it; returns its id
+    std::string AddImportedProfile(Profile imported);
+
+    // Convenience: ReadProfileFile + AddImportedProfile + ActivateProfile
     bool ImportProfile(const std::filesystem::path& srcPath);
 
 private:
