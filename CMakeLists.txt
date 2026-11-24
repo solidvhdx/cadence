@@ -65,6 +65,46 @@ target_link_options(cadence_compile_options INTERFACE
 
 if(CADENCE_USE_ASAN)
     target_compile_options(cadence_compile_options INTERFACE /fsanitize=address)
+
+    # The Visual Studio generator only adds the sanitizer library folder to the linker search path when
+    # ASan is enabled through the IDE project setting. With a plain /fsanitize=address flag (as here) the
+    # linker reports LNK1104 for clang_rt.asan_*.lib, so locate the MSVC sanitizer files ourselves.
+    get_filename_component(CADENCE_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)            # ...\MSVC\<ver>\bin\Hostx64\x64
+    get_filename_component(CADENCE_MSVC_ROOT    "${CADENCE_MSVC_BIN_DIR}/../../.." ABSOLUTE)     # ...\MSVC\<ver>
+    get_filename_component(CADENCE_VC_ROOT      "${CADENCE_MSVC_ROOT}/../../.." ABSOLUTE)        # ...\VC
+
+    # Finds file_name below the active MSVC toolset (preferred) or anywhere below VC\
+    function(cadence_find_msvc_file out_var file_name required)
+        foreach(search_root IN ITEMS "${CADENCE_MSVC_BIN_DIR}" "${CADENCE_MSVC_ROOT}" "${CADENCE_VC_ROOT}")
+            file(GLOB_RECURSE hits LIST_DIRECTORIES false "${search_root}/${file_name}")
+            if(hits)
+                list(GET hits 0 first_hit)
+                set(${out_var} "${first_hit}" PARENT_SCOPE)
+                return()
+            endif()
+        endforeach()
+        if(required)
+            message(FATAL_ERROR "${file_name} was not found below ${CADENCE_VC_ROOT}. "
+                                "Install the Visual Studio component 'MSVC AddressSanitizer' "
+                                "(Microsoft.VisualStudio.Component.VC.ASAN).")
+        endif()
+        set(${out_var} "" PARENT_SCOPE)
+    endfunction()
+
+    set(CADENCE_SANITIZER_LIBS clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_dynamic_runtime_thunk-x86_64.lib)
+    if(CADENCE_BUILD_FUZZERS)
+        list(APPEND CADENCE_SANITIZER_LIBS clang_rt.fuzzer_MD-x86_64.lib)
+    endif()
+    foreach(sanitizer_lib IN LISTS CADENCE_SANITIZER_LIBS)
+        cadence_find_msvc_file(sanitizer_lib_path ${sanitizer_lib} TRUE)
+        get_filename_component(sanitizer_lib_dir "${sanitizer_lib_path}" DIRECTORY)
+        target_link_directories(cadence_compile_options INTERFACE "${sanitizer_lib_dir}")
+        message(STATUS "Sanitizer library ${sanitizer_lib}: ${sanitizer_lib_dir}")
+    endforeach()
+
+    # The ASan runtime DLL must sit next to instrumented executables (copied after each build below)
+    cadence_find_msvc_file(CADENCE_ASAN_DLL     clang_rt.asan_dynamic-x86_64.dll     TRUE)
+    cadence_find_msvc_file(CADENCE_ASAN_DBG_DLL clang_rt.asan_dbg_dynamic-x86_64.dll FALSE)
 else()
     target_link_options(cadence_compile_options INTERFACE
         /CETCOMPAT
@@ -234,17 +274,15 @@ endif()
 # AddressSanitizer runtime next to instrumented executables (so ctest / fuzz runs need no PATH setup)
 # ---------------------------------------------------------------------------
 if(CADENCE_USE_ASAN)
-    get_filename_component(CADENCE_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     set(CADENCE_ASAN_TARGETS test_core bench_timing Cadence)
     if(CADENCE_BUILD_FUZZERS)
         list(APPEND CADENCE_ASAN_TARGETS fuzz_json fuzz_config)
     endif()
-    foreach(asan_dll IN ITEMS clang_rt.asan_dynamic-x86_64.dll clang_rt.asan_dbg_dynamic-x86_64.dll)
-        if(EXISTS "${CADENCE_MSVC_BIN_DIR}/${asan_dll}")
+    foreach(asan_dll IN ITEMS "${CADENCE_ASAN_DLL}" "${CADENCE_ASAN_DBG_DLL}")
+        if(asan_dll)
             foreach(asan_target IN LISTS CADENCE_ASAN_TARGETS)
                 add_custom_command(TARGET ${asan_target} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                            "${CADENCE_MSVC_BIN_DIR}/${asan_dll}" "$<TARGET_FILE_DIR:${asan_target}>"
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${asan_dll}" "$<TARGET_FILE_DIR:${asan_target}>"
                     VERBATIM)
             endforeach()
         endif()
