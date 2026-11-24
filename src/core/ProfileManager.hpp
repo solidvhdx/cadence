@@ -21,13 +21,16 @@ public:
     // Applies profile to active config (preserving independent settings cleanly)
     bool ActivateProfile(const std::string& id);
 
-    // Creates a new profile capturing current CPS & KPS configs and active mode
-    Profile& CreateFromCurrent(const std::string& name);
+    // Creates a new profile capturing current CPS & KPS configs and active mode; returns its id.
+    // (Returns the id, not a reference: references into the profile list dangle after the next insert.)
+    std::string CreateFromCurrent(const std::string& name);
 
     // Updates currently active profile with current CPS/KPS state
     bool UpdateActiveProfile();
 
-    bool DeleteProfile(const std::string& id);
+    // Takes the id by value: callers may pass a reference into the profile list itself
+    // (e.g. Profiles().back().id), which erase() would destroy before the active-profile check.
+    bool DeleteProfile(std::string id);
 
     bool ExportProfile(const std::string& id, const std::filesystem::path& destPath) const;
 

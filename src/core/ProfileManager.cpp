@@ -78,7 +78,7 @@ bool ProfileManager::ActivateProfile(const std::string& id) {
     return true;
 }
 
-Profile& ProfileManager::CreateFromCurrent(const std::string& name) {
+std::string ProfileManager::CreateFromCurrent(const std::string& name) {
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
     Profile p{};
     p.id   = std::format("prof-{:x}", static_cast<uint64_t>(ts));
@@ -89,7 +89,7 @@ Profile& ProfileManager::CreateFromCurrent(const std::string& name) {
 
     m_config.profiles.push_back(std::move(p));
     m_config.activeProfileId = m_config.profiles.back().id;
-    return m_config.profiles.back();
+    return m_config.activeProfileId;
 }
 
 bool ProfileManager::UpdateActiveProfile() {
@@ -104,7 +104,7 @@ bool ProfileManager::UpdateActiveProfile() {
     return false;
 }
 
-bool ProfileManager::DeleteProfile(const std::string& id) {
+bool ProfileManager::DeleteProfile(std::string id) {
     if (m_config.profiles.size() <= 1) {
         return false; // Always keep at least one profile
     }
