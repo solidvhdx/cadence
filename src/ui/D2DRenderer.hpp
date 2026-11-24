@@ -8,7 +8,9 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace cadence::ui {
 
@@ -80,6 +82,23 @@ private:
     ID2D1SolidColorBrush* Brush(D2D1_COLOR_F color);
     IDWriteTextFormat*    Format(TextStyle style);
 
+    // Text layouts are expensive to build (shaping, font fallback) and most labels are identical every
+    // frame, so layouts are cached by text + style + box + alignment and reused.
+    struct LayoutKey {
+        std::wstring               text;
+        TextStyle                  style  = TextStyle::Body;
+        float                      width  = 0.0f;
+        float                      height = 0.0f;
+        DWRITE_TEXT_ALIGNMENT      hAlign = DWRITE_TEXT_ALIGNMENT_LEADING;
+        DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_NEAR;
+        bool operator==(const LayoutKey&) const = default;
+    };
+    struct LayoutKeyHash {
+        size_t operator()(const LayoutKey& k) const noexcept;
+    };
+    IDWriteTextLayout* CachedLayout(std::wstring_view text, TextStyle style, float width, float height,
+                                    DWRITE_TEXT_ALIGNMENT hAlign, DWRITE_PARAGRAPH_ALIGNMENT vAlign);
+
     HWND     m_hwnd     = nullptr;
     uint32_t m_widthPx  = 1;
     uint32_t m_heightPx = 1;
@@ -97,6 +116,9 @@ private:
     Microsoft::WRL::ComPtr<ID2D1StrokeStyle>     m_roundStroke;
 
     Microsoft::WRL::ComPtr<IDWriteTextFormat> m_formats[8];
+
+    static constexpr size_t kMaxCachedLayouts = 512; // Bounded: changing numbers (CPS, %) create new entries
+    std::unordered_map<LayoutKey, Microsoft::WRL::ComPtr<IDWriteTextLayout>, LayoutKeyHash> m_layoutCache;
 };
 
 } // namespace cadence::ui

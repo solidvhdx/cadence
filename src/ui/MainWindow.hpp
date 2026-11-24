@@ -11,11 +11,14 @@
 #include <shellapi.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace cadence::ui {
@@ -100,6 +103,7 @@ private:
     void ShowToast(std::wstring text, bool isDanger = true);
     void SyncEngineAndHotkeys();
     void SaveConfigNow();
+    void ApplyConfigChange(bool resizeWindow = false); // Sync engine + hotkeys, save and redraw after a settings edit
     void RequestRender();
     void StartAnimTimer();
     void UpdateTelemetryTimer();
@@ -119,10 +123,18 @@ private:
     void RenderUpdateModal(float w, float h);
     void RenderToast(float w, float h);
 
+    // Reusable widgets (MainWindowWidgets.cpp)
+    void DrawStepperRow(float w, float& y, const wchar_t* label, const std::wstring& value, std::string_view idPrefix,
+                        std::function<void()> onDec, std::function<void()> onInc);
+    float DrawModifierChip(float rightX, float y, const wchar_t* label, bool on, const char* id, bool* field);
+    void DrawSettingToggle(float w, float& y, const wchar_t* title, const wchar_t* subtitle, bool* field, const char* id,
+                           bool resizeOnToggle = false);
+
     // Auto-Update
     void StartUpdateCheckAsync();
     void StartUpdateDownloadAsync();
     void CancelUpdateDownload();
+    void StopUpdateWorkers(); // Cancels and reaps the update threads (bounded wait, never blocks shutdown for long)
 
     // Hit-testing & Input
     void RegisterHit(D2D1_RECT_F rc, std::string id, std::function<void()> onClick, bool isPopover = false, bool isModal = false);
@@ -192,7 +204,8 @@ private:
     std::string          m_hoverId;
     std::vector<HitItem> m_hits;
 
-    // Auto-update state (shared state allows detached check/download threads to exit safely on quick shutdown)
+    // Auto-update state. The worker threads only touch UpdateShared (kept alive by shared_ptr), so a worker that
+    // is still stuck in a network call at shutdown can be detached safely after a short bounded wait.
     enum class UpdateStage : uint8_t {
         Idle = 0,
         Connecting,
@@ -203,7 +216,6 @@ private:
     enum class UpdateOutcome : uint8_t {
         None = 0,
         Applied,
-        NotWritable,
         Failed,
         Cancelled
     };
@@ -219,9 +231,17 @@ private:
         std::atomic<uint64_t>      bytesTotal{0};
 
         UpdateOutcome              outcome          = UpdateOutcome::None;
+        std::optional<UpdateError> error;
         uint64_t                   outcomeAttemptId = 0;
+
+        // Running worker counts (guarded by mtx); cv is notified whenever a worker finishes
+        std::condition_variable    cv;
+        int                        activeChecks    = 0;
+        int                        activeDownloads = 0;
     };
     std::shared_ptr<UpdateShared>      m_updateShared;
+    std::jthread                       m_updateCheckThread;
+    std::jthread                       m_updateDownloadThread;
     std::shared_ptr<std::atomic<bool>> m_updateCancelToken;
     std::optional<ReleaseInfo>         m_availableUpdate;
     bool                          m_updateModalOpen   = false;
@@ -230,6 +250,12 @@ private:
     uint64_t                      m_updateAttemptId   = 0;
     float                         m_updateProgVisual  = 0.0f;
     float                         m_updateAnimPhase   = 0.0f;
+    std::string                   m_updateNotesTag;    // Release whose notes are cached in m_updateNotesText
+    std::wstring                  m_updateNotesText;   // Plain-text excerpt of the release notes for the modal
+
+    // Persistence feedback
+    std::wstring m_startupNotice;           // Shown once after the window appears (e.g. damaged config was backed up)
+    bool         m_saveErrorShown = false;  // Avoids repeating the "could not save" toast on every edit
 
     // Smooth animation states (0 FPS when settled!)
     float        m_modeAnimT   = 0.0f; // 0 = CPS, 1 = KPS

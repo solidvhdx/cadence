@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.hpp"
+#include "core/Units.hpp"
 
 #include <array>
 #include <atomic>
@@ -13,7 +14,8 @@ public:
     PerformanceMonitor();
 
     // Called from worker thread on each real dispatched click / key press (lock-free, zero alloc)
-    void RecordEvent(int64_t timestampQpc, double targetIntervalMs, double actualIntervalMs) noexcept;
+    // targetInterval may be zero when no target applies (e.g. clicks inside a burst)
+    void RecordEvent(int64_t timestampQpc, Millis targetInterval, Millis actualInterval) noexcept;
 
     // Resets session counters and history (e.g. on mode switch or new session)
     void ResetSession() noexcept;

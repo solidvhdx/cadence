@@ -32,6 +32,11 @@ public:
                      const HotkeyBinding& kpsHotkey,
                      const HotkeyBinding& panicHotkey);
 
+    // RegisterHotKey fallback for the kill key (still works while an elevated window has focus).
+    // RegisterHotKey takes the key away from every other app, so it is only held while the engine is
+    // armed/active/paused; Raw Input handles the kill key at all other times.
+    void SetPanicFallbackEnabled(bool enabled);
+
     // Capture mode for rebinding hotkeys or KPS target key
     void BeginCapture(bool allowMouseButtons,
                       std::function<void(HotkeyBinding)> onCaptured,
@@ -66,6 +71,7 @@ private:
     HotkeyBinding   m_kpsBinding{HotkeySource::Keyboard, VK_F7};
     HotkeyBinding   m_panicBinding{HotkeySource::Keyboard, VK_F12};
     bool            m_panicRegistered = false;
+    bool            m_panicFallbackWanted = false;
     uint64_t        m_lastPanicMs     = 0;
 
     // Tracks physical key-down state & timestamps to ignore OS auto-repeat while auto-healing dropped KEY_UP (UAC/UIPI)

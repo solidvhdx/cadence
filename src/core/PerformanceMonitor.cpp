@@ -42,10 +42,10 @@ PerformanceMonitor::PerformanceMonitor() {
 }
 
 void PerformanceMonitor::RecordEvent(int64_t timestampQpc,
-                                     double targetIntervalMs,
-                                     double actualIntervalMs) noexcept {
+                                     Millis targetInterval,
+                                     Millis actualInterval) noexcept {
     const uint64_t idx = m_writeIdx.load(std::memory_order_relaxed);
-    m_ring[idx & kRingMask] = Sample{timestampQpc, targetIntervalMs, actualIntervalMs};
+    m_ring[idx & kRingMask] = Sample{timestampQpc, targetInterval.count(), actualInterval.count()};
     m_writeIdx.store(idx + 1, std::memory_order_release);
     m_sessionCount.fetch_add(1, std::memory_order_relaxed);
 }

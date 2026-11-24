@@ -9,9 +9,24 @@ if(NOT MSVC)
     message(FATAL_ERROR "Cadence targets Windows 11 with MSVC (C++23).")
 endif()
 
-# Link the MSVC runtime statically: Cadence.exe then needs no vcruntime140.dll / msvcp140.dll,
-# which Windows would otherwise search next to the exe first (e.g. in the Downloads folder).
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Developer / CI options (all OFF for release builds)
+option(CADENCE_ENABLE_ASAN    "Build with MSVC AddressSanitizer (tests and CI only)" OFF)
+option(CADENCE_BUILD_FUZZERS  "Build libFuzzer targets fuzz_json / fuzz_config (implies AddressSanitizer)" OFF)
+option(CADENCE_ENABLE_ANALYZE "Run MSVC /analyze static analysis (reports warnings, does not fail the build)" OFF)
+
+set(CADENCE_USE_ASAN OFF)
+if(CADENCE_ENABLE_ASAN OR CADENCE_BUILD_FUZZERS)
+    set(CADENCE_USE_ASAN ON)
+endif()
+
+if(CADENCE_USE_ASAN)
+    # AddressSanitizer is built around the DLL runtime; instrumented builds are never shipped
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+else()
+    # Link the MSVC runtime statically: Cadence.exe then needs no vcruntime140.dll / msvcp140.dll,
+    # which Windows would otherwise search next to the exe first (e.g. in the Downloads folder).
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 # Common C++23 compiler flags and strict security diagnostics
 add_library(cadence_compile_options INTERFACE)
@@ -45,17 +60,33 @@ target_link_options(cadence_compile_options INTERFACE
     /DYNAMICBASE
     /NXCOMPAT
     /HIGHENTROPYVA
-    /CETCOMPAT
-    # Resolve static imports from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never from the exe folder
-    /DEPENDENTLOADFLAG:0x800
     $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF;/GUARD:CF;/GUARD:EHCONT>
 )
+
+if(CADENCE_USE_ASAN)
+    target_compile_options(cadence_compile_options INTERFACE /fsanitize=address)
+else()
+    target_link_options(cadence_compile_options INTERFACE
+        /CETCOMPAT
+        # Resolve static imports from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never from the exe folder.
+        # Not used with ASan: its runtime DLL lives next to the test executables.
+        /DEPENDENTLOADFLAG:0x800
+    )
+endif()
+
+if(CADENCE_ENABLE_ANALYZE)
+    # Code analysis findings are reported in the build log but never fail the build
+    target_compile_options(cadence_compile_options INTERFACE /analyze /analyze:WX-)
+endif()
 
 # ---------------------------------------------------------------------------
 # Core Engine Library (100% UI-independent)
 # ---------------------------------------------------------------------------
 add_library(cadence_core STATIC
     src/core/Types.hpp
+    src/core/Units.hpp
+    src/core/StringUtil.hpp
+    src/core/StringUtil.cpp
     src/core/JsonParser.hpp
     src/core/JsonParser.cpp
     src/core/TimingEngine.hpp
@@ -96,10 +127,17 @@ target_link_libraries(cadence_core PUBLIC
 add_executable(Cadence WIN32
     src/main.cpp
     src/ui/Theme.hpp
+    src/ui/UiHelpers.hpp
     src/ui/D2DRenderer.hpp
     src/ui/D2DRenderer.cpp
     src/ui/MainWindow.hpp
     src/ui/MainWindow.cpp
+    src/ui/MainWindowRender.cpp
+    src/ui/MainWindowControls.cpp
+    src/ui/MainWindowWidgets.cpp
+    src/ui/MainWindowProfiles.cpp
+    src/ui/MainWindowUpdate.cpp
+    src/ui/MainWindowInput.cpp
     resources/app.manifest
     resources/app.rc
 )
@@ -137,12 +175,78 @@ add_executable(bench_timing
 target_link_libraries(bench_timing PRIVATE cadence_core)
 
 # ---------------------------------------------------------------------------
-# Unit & Integration Test Executable
+# Unit & Integration Tests (self-contained runner, one CTest entry per test case)
 # ---------------------------------------------------------------------------
 add_executable(test_core
+    tests/TestHarness.hpp
     tests/test_core.cpp
 )
 target_link_libraries(test_core PRIVATE cadence_core)
 
 enable_testing()
-add_test(NAME CadenceCoreTests COMMAND test_core)
+set(CADENCE_TEST_CASES
+    ConfigRoundTrip
+    ConfigParserHardening
+    ConfigSequenceAndCoordsCapped
+    ConfigLoadErrorsAndBackup
+    ConfigVersioning
+    ProfileActivationIsolation
+    ProfileImportPreviewAndAdd
+    TimingUnitConversions
+    TimingPrecisionAndJitter
+    PerformanceMonitorRates
+    StringUtilRoundTrip
+    UpdateSemVer
+    UpdateReleaseJson
+    UpdateSha256AndPeChecks
+    UpdateErrorReasons
+)
+foreach(test_case IN LISTS CADENCE_TEST_CASES)
+    add_test(NAME ${test_case} COMMAND test_core ${test_case})
+endforeach()
+# Fails when a test exists in test_core.cpp but is missing from the list above (or the other way round)
+list(JOIN CADENCE_TEST_CASES "," CADENCE_TEST_CASES_CSV)
+add_test(NAME TestListInSync COMMAND test_core --expect-tests=${CADENCE_TEST_CASES_CSV})
+
+# ---------------------------------------------------------------------------
+# Fuzzing (libFuzzer, built into MSVC)
+# ---------------------------------------------------------------------------
+if(CADENCE_BUILD_FUZZERS)
+    add_executable(fuzz_json
+        tests/fuzz_json.cpp
+        src/core/JsonParser.cpp
+    )
+    add_executable(fuzz_config
+        tests/fuzz_config.cpp
+        src/core/JsonParser.cpp
+        src/core/StringUtil.cpp
+        src/core/ConfigManager.cpp
+        src/core/UpdateChecker.cpp
+    )
+    foreach(fuzzer IN ITEMS fuzz_json fuzz_config)
+        target_include_directories(${fuzzer} PRIVATE src)
+        target_link_libraries(${fuzzer} PRIVATE cadence_compile_options shell32 ole32 bcrypt winhttp)
+        target_compile_options(${fuzzer} PRIVATE /fsanitize=fuzzer)
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# AddressSanitizer runtime next to instrumented executables (so ctest / fuzz runs need no PATH setup)
+# ---------------------------------------------------------------------------
+if(CADENCE_USE_ASAN)
+    get_filename_component(CADENCE_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(CADENCE_ASAN_TARGETS test_core bench_timing Cadence)
+    if(CADENCE_BUILD_FUZZERS)
+        list(APPEND CADENCE_ASAN_TARGETS fuzz_json fuzz_config)
+    endif()
+    foreach(asan_dll IN ITEMS clang_rt.asan_dynamic-x86_64.dll clang_rt.asan_dbg_dynamic-x86_64.dll)
+        if(EXISTS "${CADENCE_MSVC_BIN_DIR}/${asan_dll}")
+            foreach(asan_target IN LISTS CADENCE_ASAN_TARGETS)
+                add_custom_command(TARGET ${asan_target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${CADENCE_MSVC_BIN_DIR}/${asan_dll}" "$<TARGET_FILE_DIR:${asan_target}>"
+                    VERBATIM)
+            endforeach()
+        endif()
+    endforeach()
+endif()

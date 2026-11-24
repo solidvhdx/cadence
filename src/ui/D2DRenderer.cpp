@@ -47,6 +47,7 @@ bool D2DRenderer::Initialize(HWND hwnd, uint32_t widthPx, uint32_t heightPx, flo
 }
 
 void D2DRenderer::Shutdown() {
+    m_layoutCache.clear();
     DestroyBackbuffer();
     m_brush.Reset();
     m_rt.Reset();
@@ -220,13 +221,47 @@ bool D2DRenderer::EndFrame(HDC paintDc) {
     return true;
 }
 
-float D2DRenderer::MeasureTextWidth(std::wstring_view text, TextStyle style) {
+size_t D2DRenderer::LayoutKeyHash::operator()(const LayoutKey& k) const noexcept {
+    size_t h = std::hash<std::wstring>{}(k.text);
+    auto mix = [&h](size_t v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); };
+    mix(static_cast<size_t>(k.style));
+    mix(std::hash<float>{}(k.width));
+    mix(std::hash<float>{}(k.height));
+    mix(static_cast<size_t>(k.hAlign));
+    mix(static_cast<size_t>(k.vAlign));
+    return h;
+}
+
+IDWriteTextLayout* D2DRenderer::CachedLayout(std::wstring_view text, TextStyle style, float width, float height,
+                                             DWRITE_TEXT_ALIGNMENT hAlign, DWRITE_PARAGRAPH_ALIGNMENT vAlign) {
     auto* fmt = Format(style);
-    if (!m_dwriteFactory || !fmt || text.empty()) return 0.0f;
-    ComPtr<IDWriteTextLayout> layout;
-    if (FAILED(m_dwriteFactory->CreateTextLayout(text.data(), static_cast<UINT32>(text.size()), fmt, 1000.0f, 100.0f, &layout))) {
-        return 0.0f;
+    if (!m_dwriteFactory || !fmt || text.empty() || width < 0.0f || height < 0.0f) return nullptr;
+
+    // "+ 0.0f" turns -0.0 into +0.0 so equal keys always hash equally
+    LayoutKey key{std::wstring(text), style, width + 0.0f, height + 0.0f, hAlign, vAlign};
+    if (const auto it = m_layoutCache.find(key); it != m_layoutCache.end()) {
+        return it->second.Get();
     }
+
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(m_dwriteFactory->CreateTextLayout(text.data(), static_cast<UINT32>(text.size()), fmt, width, height, &layout))) {
+        return nullptr;
+    }
+    layout->SetTextAlignment(hAlign);
+    layout->SetParagraphAlignment(vAlign);
+
+    if (m_layoutCache.size() >= kMaxCachedLayouts) {
+        m_layoutCache.clear();
+    }
+    IDWriteTextLayout* raw = layout.Get();
+    m_layoutCache.emplace(std::move(key), std::move(layout));
+    return raw;
+}
+
+float D2DRenderer::MeasureTextWidth(std::wstring_view text, TextStyle style) {
+    IDWriteTextLayout* layout = CachedLayout(text, style, 1000.0f, 100.0f,
+                                             DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    if (!layout) return 0.0f;
     DWRITE_TEXT_METRICS m{};
     if (SUCCEEDED(layout->GetMetrics(&m))) {
         return m.widthIncludingTrailingWhitespace;
@@ -282,18 +317,12 @@ void D2DRenderer::DrawText(std::wstring_view text,
                            D2D1_COLOR_F color,
                            DWRITE_TEXT_ALIGNMENT hAlign,
                            DWRITE_PARAGRAPH_ALIGNMENT vAlign) {
-    auto* fmt = Format(style);
-    if (!fmt || text.empty()) return;
-    fmt->SetTextAlignment(hAlign);
-    fmt->SetParagraphAlignment(vAlign);
-    m_rt->DrawTextW(
-        text.data(),
-        static_cast<UINT32>(text.size()),
-        fmt,
-        rc,
-        Brush(color),
-        D2D1_DRAW_TEXT_OPTIONS_CLIP
-    );
+    IDWriteTextLayout* layout = CachedLayout(text, style,
+                                             std::max(0.0f, rc.right - rc.left),
+                                             std::max(0.0f, rc.bottom - rc.top),
+                                             hAlign, vAlign);
+    if (!layout) return;
+    m_rt->DrawTextLayout(D2D1::Point2F(rc.left, rc.top), layout, Brush(color), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void D2DRenderer::DrawSlider(D2D1_RECT_F trackRc, float t, D2D1_COLOR_F accent, bool hovered, bool dragging) {

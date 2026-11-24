@@ -1,9 +1,11 @@
 #include "core/EngineController.hpp"
+#include "core/StringUtil.hpp"
 
 #include <avrt.h>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace cadence {
 
@@ -81,15 +83,9 @@ void EngineController::UpdateConfig(OperatingMode mode,
                                     const CpsConfig& cps,
                                     const KpsConfig& kps,
                                     const GlobalSettings& settings) {
-    bool modeChanged = false;
-    {
-        std::scoped_lock lock(m_cfgMutex);
-        modeChanged = (m_mode != mode);
-        m_mode      = mode;
-        m_cps       = cps;
-        m_kps       = kps;
-        m_settings  = settings;
-    }
+    auto next = std::make_shared<const EngineSettings>(EngineSettings{mode, cps, kps, settings});
+    const auto prev = m_settings.exchange(std::move(next), std::memory_order_acq_rel);
+    const bool modeChanged = !prev || prev->mode != mode;
 
     TimingEngine::SetPowerThrottlingDisabled(settings.disablePowerThrottle);
 
@@ -120,11 +116,7 @@ std::string EngineController::QueryWindowProcessName(HWND hwnd) {
         if (slash != std::wstring_view::npos) {
             sv.remove_prefix(slash + 1);
         }
-        const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, sv.data(), static_cast<int>(sv.size()), nullptr, 0, nullptr, nullptr);
-        if (utf8Len > 0) {
-            result.resize(static_cast<size_t>(utf8Len));
-            WideCharToMultiByte(CP_UTF8, 0, sv.data(), static_cast<int>(sv.size()), result.data(), utf8Len, nullptr, nullptr);
-        }
+        result = WideToUtf8(sv);
     }
     CloseHandle(proc);
     return result;
@@ -170,24 +162,16 @@ bool EngineController::IsSelfWindowBlocking(bool checkCursorForMouse, CursorMode
 }
 
 void EngineController::Start(bool fromUiButton) {
-    bool stopOnSelfFocus = true;
-    OperatingMode mode{};
-    CpsConfig cps{};
-    {
-        std::scoped_lock lock(m_cfgMutex);
-        stopOnSelfFocus = m_settings.stopOnSelfFocus;
-        mode            = m_mode;
-        cps             = m_cps;
-    }
+    const auto cfg = Settings();
 
     m_perf.ResetSession();
     m_abortWait.store(false, std::memory_order_release);
     if (m_cancelEvent) ResetEvent(m_cancelEvent);
 
     const bool selfFocused = m_appFocused.load(std::memory_order_acquire) ||
-                             IsSelfWindowBlocking(mode == OperatingMode::CPS, cps.cursorMode);
+                             IsSelfWindowBlocking(cfg->mode == OperatingMode::CPS, cfg->cps.cursorMode);
 
-    if (stopOnSelfFocus && selfFocused) {
+    if (cfg->settings.stopOnSelfFocus && selfFocused) {
         if (fromUiButton) {
             // User clicked "Start" inside Cadence: arm engine so it activates as soon as they switch to target window
             TransitionState(EngineState::Armed);
@@ -227,12 +211,7 @@ void EngineController::TogglePause() {
         m_keyboard.ReleaseAll();
         TransitionState(EngineState::Paused);
     } else if (st == EngineState::Paused) {
-        bool stopOnSelfFocus = true;
-        {
-            std::scoped_lock lock(m_cfgMutex);
-            stopOnSelfFocus = m_settings.stopOnSelfFocus;
-        }
-        if (stopOnSelfFocus && m_appFocused.load(std::memory_order_acquire)) {
+        if (Settings()->settings.stopOnSelfFocus && m_appFocused.load(std::memory_order_acquire)) {
             TransitionState(EngineState::Armed);
             return;
         }
@@ -244,13 +223,9 @@ void EngineController::TogglePause() {
 }
 
 void EngineController::HandleHotkeyPress(OperatingMode hotkeyMode) {
-    OperatingMode activeMode{};
-    ActivationMode activation{};
-    {
-        std::scoped_lock lock(m_cfgMutex);
-        activeMode = m_mode;
-        activation = (activeMode == OperatingMode::CPS) ? m_cps.activation : m_kps.activation;
-    }
+    const auto cfg = Settings();
+    const OperatingMode  activeMode = cfg->mode;
+    const ActivationMode activation = (activeMode == OperatingMode::CPS) ? cfg->cps.activation : cfg->kps.activation;
 
     // Only react to the currently selected operating mode's hotkey
     if (hotkeyMode != activeMode) {
@@ -273,13 +248,9 @@ void EngineController::HandleHotkeyPress(OperatingMode hotkeyMode) {
 }
 
 void EngineController::HandleHotkeyRelease(OperatingMode hotkeyMode) {
-    OperatingMode activeMode{};
-    ActivationMode activation{};
-    {
-        std::scoped_lock lock(m_cfgMutex);
-        activeMode = m_mode;
-        activation = (activeMode == OperatingMode::CPS) ? m_cps.activation : m_kps.activation;
-    }
+    const auto cfg = Settings();
+    const OperatingMode  activeMode = cfg->mode;
+    const ActivationMode activation = (activeMode == OperatingMode::CPS) ? cfg->cps.activation : cfg->kps.activation;
 
     if (hotkeyMode != activeMode) {
         return;
@@ -296,12 +267,7 @@ void EngineController::HandleHotkeyRelease(OperatingMode hotkeyMode) {
 void EngineController::NotifyAppFocusChanged(bool isFocused) {
     m_appFocused.store(isFocused, std::memory_order_release);
 
-    bool stopOnSelfFocus = true;
-    {
-        std::scoped_lock lock(m_cfgMutex);
-        stopOnSelfFocus = m_settings.stopOnSelfFocus;
-    }
-    if (!stopOnSelfFocus) {
+    if (!Settings()->settings.stopOnSelfFocus) {
         return;
     }
 
@@ -339,76 +305,62 @@ void EngineController::WorkerLoop(std::stop_token st) {
             if (State() != EngineState::Active) continue;
         }
 
-        // Snapshot session settings upon activation
-        GlobalSettings settingsSnapshot{};
-        {
-            std::scoped_lock lock(m_cfgMutex);
-            settingsSnapshot = m_settings;
-        }
-
         // Elevate thread via MMCSS ONLY for the duration of active clicking/pressing
-        MmcssGuard mmcss(settingsSnapshot.mmcssPriority);
+        MmcssGuard mmcss(Settings()->settings.mmcssPriority);
 
-        int64_t  sessionStartQpc    = m_timing.NowQpc();
-        int64_t  nextTargetQpc      = sessionStartQpc;
-        int64_t  lastEventQpc       = 0;
-        double   expectedIntervalMs = 0.0;
-        uint64_t sessionEvents      = 0;
-        size_t   seqIndex           = 0;
-        HWND     cachedTargetHwnd   = nullptr;
-        bool     cachedTargetMatch  = false;
+        SessionState session{};
+        session.startQpc      = m_timing.NowQpc();
+        session.nextTargetQpc = session.startQpc;
+        HWND cachedTargetHwnd  = nullptr;
+        bool cachedTargetMatch = false;
 
         while (!st.stop_requested() && State() == EngineState::Active && !m_abortWait.load(std::memory_order_acquire)) {
-            OperatingMode mode{};
-            CpsConfig cps{};
-            KpsConfig kps{};
-            GlobalSettings gs{};
-            {
-                std::scoped_lock lock(m_cfgMutex);
-                mode = m_mode;
-                cps  = m_cps;
-                kps  = m_kps;
-                gs   = m_settings;
-            }
+            // One atomic load per cycle; the snapshot stays valid even if the UI publishes a newer one meanwhile
+            const auto snapshot = Settings();
+            const EngineSettings& cfg = *snapshot;
 
             // Self-click protection: stop immediately if Cadence window is focused or hovered
-            if (gs.stopOnSelfFocus && IsSelfWindowBlocking(mode == OperatingMode::CPS, cps.cursorMode)) {
+            if (cfg.settings.stopOnSelfFocus && IsSelfWindowBlocking(cfg.mode == OperatingMode::CPS, cfg.cps.cursorMode)) {
                 Stop();
                 break;
             }
 
             // Target-Window Lock (AutoHotkey #HotIf WinActive style): hold quietly while non-target app is focused
-            if (!MatchesTargetWindowLock(gs, cachedTargetHwnd, cachedTargetMatch)) {
+            if (!MatchesTargetWindowLock(cfg.settings, cachedTargetHwnd, cachedTargetMatch)) {
                 m_mouse.ReleaseAll();
                 m_keyboard.ReleaseAll();
-                if (!m_timing.WaitForMs(25.0, m_cancelEvent, m_abortWait, false)) {
+                if (!m_timing.WaitFor(Millis{25.0}, m_cancelEvent, m_abortWait, false)) {
                     break;
                 }
-                nextTargetQpc      = m_timing.NowQpc();
-                lastEventQpc       = 0;
-                expectedIntervalMs = 0.0;
+                session.nextTargetQpc    = m_timing.NowQpc();
+                session.lastEventQpc     = 0;
+                session.expectedInterval = Millis{0.0};
                 continue;
             }
 
             // Repeat limit check (Count or Duration)
-            const RepeatLimitMode limMode = (mode == OperatingMode::CPS) ? cps.limitMode : kps.limitMode;
-            const uint32_t limVal         = (mode == OperatingMode::CPS) ? cps.limitValue : kps.limitValue;
-            if (limMode == RepeatLimitMode::Count && sessionEvents >= limVal) {
+            const RepeatLimitMode limMode = (cfg.mode == OperatingMode::CPS) ? cfg.cps.limitMode : cfg.kps.limitMode;
+            const uint32_t limVal         = (cfg.mode == OperatingMode::CPS) ? cfg.cps.limitValue : cfg.kps.limitValue;
+            if (limMode == RepeatLimitMode::Count && session.events >= limVal) {
                 Stop();
                 break;
             }
             if (limMode == RepeatLimitMode::Duration) {
-                const double elapsedSec = m_timing.QpcToMilliseconds(m_timing.NowQpc() - sessionStartQpc) / 1000.0;
-                if (elapsedSec >= static_cast<double>(limVal)) {
+                const Seconds elapsed = m_timing.QpcToMillis(m_timing.NowQpc() - session.startQpc);
+                if (elapsed >= Seconds{static_cast<double>(limVal)}) {
                     Stop();
                     break;
                 }
             }
 
-            if (mode == OperatingMode::CPS) {
-                RunCpsCycle(cps, gs.hybridQpcTimer, gs.stopOnSelfFocus, nextTargetQpc, lastEventQpc, expectedIntervalMs, sessionEvents);
+            if (cfg.mode == OperatingMode::CPS) {
+                // A burst must never overshoot a Count limit
+                const uint64_t budget = (limMode == RepeatLimitMode::Count)
+                    ? static_cast<uint64_t>(limVal) - session.events
+                    : std::numeric_limits<uint64_t>::max();
+                RunCpsCycle(cfg.cps, cfg.settings.hybridQpcTimer, cfg.settings.stopOnSelfFocus, budget, session);
             } else {
-                RunKpsCycle(kps, gs.hybridQpcTimer, gs.stopOnSelfFocus, nextTargetQpc, lastEventQpc, expectedIntervalMs, sessionEvents, seqIndex);
+                RunKpsCycle(cfg.kps, cfg.settings.hybridQpcTimer, cfg.settings.stopOnSelfFocus, session);
             }
         }
 
@@ -421,15 +373,13 @@ void EngineController::WorkerLoop(std::stop_token st) {
 void EngineController::RunCpsCycle(const CpsConfig& cfg,
                                    bool hybridSpin,
                                    bool stopOnSelfFocus,
-                                   int64_t& nextTargetQpc,
-                                   int64_t& lastEventQpc,
-                                   double& expectedIntervalMs,
-                                   uint64_t& sessionEvents) {
-    const double baseIntervalMs = 1000.0 / std::clamp(cfg.rateCps, 0.5, 500.0);
-    const double jitter         = cfg.jitterEnabled ? m_timing.SampleJitterMs(cfg.jitterMs) : 0.0;
-    const double nextIntervalMs = std::max(0.5, baseIntervalMs + jitter);
+                                   uint64_t eventBudget,
+                                   SessionState& s) {
+    const Millis baseInterval{1000.0 / std::clamp(cfg.rateCps, 0.5, 500.0)};
+    const Millis jitter       = cfg.jitterEnabled ? m_timing.SampleJitter(Millis{cfg.jitterMs}) : Millis{0.0};
+    const Millis nextInterval = std::max(Millis{0.5}, baseInterval + jitter);
 
-    if (!m_timing.WaitUntil(nextTargetQpc, m_cancelEvent, m_abortWait, hybridSpin)) {
+    if (!m_timing.WaitUntil(s.nextTargetQpc, m_cancelEvent, m_abortWait, hybridSpin)) {
         return;
     }
 
@@ -440,18 +390,19 @@ void EngineController::RunCpsCycle(const CpsConfig& cfg,
     }
 
     const int64_t dispatchQpc = m_timing.NowQpc();
-    const double actualIntervalMs = (lastEventQpc > 0)
-        ? m_timing.QpcToMilliseconds(dispatchQpc - lastEventQpc)
-        : 0.0;
-    lastEventQpc = dispatchQpc;
+    const Millis actualInterval = (s.lastEventQpc > 0)
+        ? m_timing.QpcToMillis(dispatchQpc - s.lastEventQpc)
+        : Millis{0.0};
+    s.lastEventQpc = dispatchQpc;
 
     uint32_t clicksInPattern = 1;
     if (cfg.pattern == ClickPattern::Double)           clicksInPattern = 2;
     else if (cfg.pattern == ClickPattern::TripleBurst) clicksInPattern = 3;
     else if (cfg.pattern == ClickPattern::CustomBurst) clicksInPattern = std::clamp(cfg.burstCount, 2u, 20u);
+    clicksInPattern = static_cast<uint32_t>(std::clamp<uint64_t>(eventBudget, 1, clicksInPattern));
 
-    const double maxHoldMs = std::max(0.2, (nextIntervalMs / static_cast<double>(clicksInPattern)) * 0.45);
-    const double holdMs    = std::min(static_cast<double>(cfg.holdDurationMs), maxHoldMs);
+    const Millis maxHold = std::max(Millis{0.2}, (nextInterval / static_cast<double>(clicksInPattern)) * 0.45);
+    const Millis hold    = std::min(Millis{static_cast<double>(cfg.holdDurationMs)}, maxHold);
 
     for (uint32_t i = 0; i < clicksInPattern; ++i) {
         if (m_abortWait.load(std::memory_order_acquire)) break;
@@ -461,26 +412,26 @@ void EngineController::RunCpsCycle(const CpsConfig& cfg,
         }
 
         m_mouse.SendDown(cfg.button, cfg.cursorMode, cfg.lockX, cfg.lockY, cfg.lockedMicroWiggle);
-        if (holdMs >= 0.25) {
-            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+        if (hold >= Millis{0.25}) {
+            if (!m_timing.WaitFor(hold, m_cancelEvent, m_abortWait, hybridSpin)) {
                 return; // Aborted: WorkerLoop's ReleaseAll() handles clean release without duplicate UP
             }
         }
         m_mouse.SendUp(cfg.button, cfg.cursorMode, cfg.lockX, cfg.lockY);
 
-        ++sessionEvents;
+        ++s.events;
         if (i == 0) {
-            m_perf.RecordEvent(dispatchQpc, expectedIntervalMs, actualIntervalMs);
+            m_perf.RecordEvent(dispatchQpc, s.expectedInterval, actualInterval);
         } else {
             const int64_t subQpc = m_timing.NowQpc();
-            const double subDtMs = m_timing.QpcToMilliseconds(subQpc - lastEventQpc);
-            lastEventQpc = subQpc;
-            m_perf.RecordEvent(subQpc, 0.0, subDtMs);
+            const Millis  subDt  = m_timing.QpcToMillis(subQpc - s.lastEventQpc);
+            s.lastEventQpc = subQpc;
+            m_perf.RecordEvent(subQpc, Millis{0.0}, subDt);
         }
 
         if (i + 1 < clicksInPattern) {
-            const double intraGapMs = std::min(22.0, maxHoldMs);
-            if (!m_timing.WaitForMs(intraGapMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+            const Millis intraGap = std::min(Millis{22.0}, maxHold);
+            if (!m_timing.WaitFor(intraGap, m_cancelEvent, m_abortWait, hybridSpin)) {
                 return;
             }
         }
@@ -489,35 +440,31 @@ void EngineController::RunCpsCycle(const CpsConfig& cfg,
     const int64_t nowAfter = m_timing.NowQpc();
     if (cfg.pattern == ClickPattern::CustomBurst) {
         // Measure burst cooldown strictly after the burst finishes
-        const double cooldownMs = std::max(0.5, static_cast<double>(cfg.burstCooldownMs) + jitter);
-        nextTargetQpc      = nowAfter + m_timing.MicrosecondsToQpc(cooldownMs * 1000.0);
-        expectedIntervalMs = m_timing.QpcToMilliseconds(nextTargetQpc - lastEventQpc);
+        const Millis cooldown = std::max(Millis{0.5}, Millis{static_cast<double>(cfg.burstCooldownMs)} + jitter);
+        s.nextTargetQpc    = nowAfter + m_timing.ToQpcTicks(cooldown);
+        s.expectedInterval = m_timing.QpcToMillis(s.nextTargetQpc - s.lastEventQpc);
     } else {
         // Drift-compensated next deadline (clamped if OS stalled to avoid burst catch-up)
-        const int64_t stepQpc = m_timing.MicrosecondsToQpc(nextIntervalMs * 1000.0);
-        nextTargetQpc += stepQpc;
-        if (nextTargetQpc < nowAfter - stepQpc) {
-            nextTargetQpc = nowAfter + stepQpc;
+        const int64_t stepQpc = m_timing.ToQpcTicks(nextInterval);
+        s.nextTargetQpc += stepQpc;
+        if (s.nextTargetQpc < nowAfter - stepQpc) {
+            s.nextTargetQpc = nowAfter + stepQpc;
         }
-        expectedIntervalMs = (clicksInPattern == 1)
-            ? nextIntervalMs
-            : m_timing.QpcToMilliseconds(std::max<int64_t>(0, nextTargetQpc - lastEventQpc));
+        s.expectedInterval = (clicksInPattern == 1)
+            ? nextInterval
+            : m_timing.QpcToMillis(std::max<int64_t>(0, s.nextTargetQpc - s.lastEventQpc));
     }
 }
 
 void EngineController::RunKpsCycle(const KpsConfig& cfg,
                                    bool hybridSpin,
                                    bool stopOnSelfFocus,
-                                   int64_t& nextTargetQpc,
-                                   int64_t& lastEventQpc,
-                                   double& expectedIntervalMs,
-                                   uint64_t& sessionEvents,
-                                   size_t& seqIndex) {
-    const double baseIntervalMs = 1000.0 / std::clamp(cfg.rateKps, 0.5, 500.0);
-    const double jitter         = cfg.jitterEnabled ? m_timing.SampleJitterMs(cfg.jitterMs) : 0.0;
-    const double nextIntervalMs = std::max(0.5, baseIntervalMs + jitter);
+                                   SessionState& s) {
+    const Millis baseInterval{1000.0 / std::clamp(cfg.rateKps, 0.5, 500.0)};
+    const Millis jitter       = cfg.jitterEnabled ? m_timing.SampleJitter(Millis{cfg.jitterMs}) : Millis{0.0};
+    const Millis nextInterval = std::max(Millis{0.5}, baseInterval + jitter);
 
-    if (!m_timing.WaitUntil(nextTargetQpc, m_cancelEvent, m_abortWait, hybridSpin)) {
+    if (!m_timing.WaitUntil(s.nextTargetQpc, m_cancelEvent, m_abortWait, hybridSpin)) {
         return;
     }
 
@@ -527,43 +474,44 @@ void EngineController::RunKpsCycle(const KpsConfig& cfg,
     }
 
     const int64_t dispatchQpc = m_timing.NowQpc();
-    const double actualIntervalMs = (lastEventQpc > 0)
-        ? m_timing.QpcToMilliseconds(dispatchQpc - lastEventQpc)
-        : 0.0;
-    lastEventQpc = dispatchQpc;
+    const Millis actualInterval = (s.lastEventQpc > 0)
+        ? m_timing.QpcToMillis(dispatchQpc - s.lastEventQpc)
+        : Millis{0.0};
+    s.lastEventQpc = dispatchQpc;
 
-    const double holdMs = std::min(static_cast<double>(cfg.pressDurationMs), std::max(0.2, nextIntervalMs * 0.55));
+    const Millis hold = std::min(Millis{static_cast<double>(cfg.pressDurationMs)},
+                                 std::max(Millis{0.2}, nextInterval * 0.55));
 
     if (cfg.inputMode == KeyInputMode::Sequence && !cfg.sequenceVks.empty()) {
-        const uint16_t vk = cfg.sequenceVks[seqIndex % cfg.sequenceVks.size()];
-        ++seqIndex;
+        const uint16_t vk = cfg.sequenceVks[s.seqIndex % cfg.sequenceVks.size()];
+        ++s.seqIndex;
         m_keyboard.SendKeyDown(vk, cfg.dispatchMethod);
-        if (holdMs >= 0.25) {
-            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+        if (hold >= Millis{0.25}) {
+            if (!m_timing.WaitFor(hold, m_cancelEvent, m_abortWait, hybridSpin)) {
                 return;
             }
         }
         m_keyboard.SendKeyUp(vk, cfg.dispatchMethod);
     } else {
         m_keyboard.SendChordDown(cfg.targetVk, cfg.modCtrl, cfg.modShift, cfg.modAlt, cfg.dispatchMethod);
-        if (holdMs >= 0.25) {
-            if (!m_timing.WaitForMs(holdMs, m_cancelEvent, m_abortWait, hybridSpin)) {
+        if (hold >= Millis{0.25}) {
+            if (!m_timing.WaitFor(hold, m_cancelEvent, m_abortWait, hybridSpin)) {
                 return;
             }
         }
         m_keyboard.SendChordUp(cfg.targetVk, cfg.modCtrl, cfg.modShift, cfg.modAlt, cfg.dispatchMethod);
     }
 
-    ++sessionEvents;
-    m_perf.RecordEvent(dispatchQpc, expectedIntervalMs, actualIntervalMs);
+    ++s.events;
+    m_perf.RecordEvent(dispatchQpc, s.expectedInterval, actualInterval);
 
-    const int64_t stepQpc = m_timing.MicrosecondsToQpc(nextIntervalMs * 1000.0);
-    nextTargetQpc += stepQpc;
+    const int64_t stepQpc = m_timing.ToQpcTicks(nextInterval);
+    s.nextTargetQpc += stepQpc;
     const int64_t nowAfter = m_timing.NowQpc();
-    if (nextTargetQpc < nowAfter - stepQpc) {
-        nextTargetQpc = nowAfter + stepQpc;
+    if (s.nextTargetQpc < nowAfter - stepQpc) {
+        s.nextTargetQpc = nowAfter + stepQpc;
     }
-    expectedIntervalMs = nextIntervalMs;
+    s.expectedInterval = nextInterval;
 }
 
 } // namespace cadence

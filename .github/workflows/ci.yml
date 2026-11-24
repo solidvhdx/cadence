@@ -46,6 +46,80 @@ jobs:
             build/Release/SHA256SUMS.txt
           if-no-files-found: error
 
+  sanitizers:
+    name: Tests with AddressSanitizer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure CMake (AddressSanitizer)
+        run: cmake -B build-asan -A x64 -DCADENCE_ENABLE_ASAN=ON
+
+      - name: Build tests (RelWithDebInfo + ASan)
+        run: cmake --build build-asan --config RelWithDebInfo --target test_core --parallel
+
+      - name: Run tests under AddressSanitizer
+        run: ctest --test-dir build-asan -C RelWithDebInfo --output-on-failure
+
+  fuzz:
+    name: Fuzz JSON & config parsers
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure CMake (libFuzzer)
+        run: cmake -B build-fuzz -A x64 -DCADENCE_BUILD_FUZZERS=ON
+
+      - name: Build fuzzers
+        run: cmake --build build-fuzz --config RelWithDebInfo --target fuzz_json fuzz_config --parallel
+
+      - name: Fuzz each target for 60 seconds
+        shell: pwsh
+        run: |
+          foreach ($fuzzer in 'fuzz_json', 'fuzz_config') {
+            $corpus = "fuzz-corpus/$fuzzer"
+            New-Item -ItemType Directory -Force -Path $corpus | Out-Null
+            '{"tag_name":"v1.0.0","body":"## Notes\n- item","assets":[]}' | Set-Content -Path "$corpus/seed-release.json" -NoNewline -Encoding utf8NoBOM
+            '{"version":1,"cps":{"rateCps":14.5},"kps":{"sequenceVks":[49,50]},"profiles":[{"id":"a","name":"b","mode":1}]}' | Set-Content -Path "$corpus/seed-config.json" -NoNewline -Encoding utf8NoBOM
+            & "build-fuzz/RelWithDebInfo/$fuzzer.exe" $corpus -max_total_time=60 -max_len=8192
+            if ($LASTEXITCODE -ne 0) { throw "$fuzzer found a crash (exit code $LASTEXITCODE)" }
+          }
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+
+  analyze:
+    name: MSVC code analysis
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure CMake (/analyze)
+        run: cmake -B build-analyze -A x64 -DCADENCE_ENABLE_ANALYZE=ON
+
+      - name: Build with /analyze (findings appear as warnings in this log)
+        run: cmake --build build-analyze --config Debug --parallel
+
   release:
     needs: build-windows
     if: startsWith(github.ref, 'refs/tags/v')

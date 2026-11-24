@@ -5,13 +5,23 @@
 #include "core/PerformanceMonitor.hpp"
 #include "core/TimingEngine.hpp"
 #include "core/Types.hpp"
+#include "core/Units.hpp"
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 
 namespace cadence {
+
+// Immutable configuration snapshot shared between the UI thread (writer) and the worker (reader).
+struct EngineSettings {
+    OperatingMode  mode = OperatingMode::CPS;
+    CpsConfig      cps{};
+    KpsConfig      kps{};
+    GlobalSettings settings{};
+};
 
 class EngineController {
 public:
@@ -24,7 +34,7 @@ public:
     void SetAppWindow(HWND hwnd) noexcept { m_appHwnd.store(hwnd, std::memory_order_release); }
     void SetStateChangedCallback(std::function<void(EngineState)> cb);
 
-    // Thread-safe config synchronization from UI thread
+    // Thread-safe config synchronization from UI thread (publishes a new immutable snapshot)
     void UpdateConfig(OperatingMode mode,
                       const CpsConfig& cps,
                       const KpsConfig& kps,
@@ -54,11 +64,23 @@ public:
     static std::string QueryWindowProcessName(HWND hwnd);
 
 private:
+    // Per-activation bookkeeping of the worker loop
+    struct SessionState {
+        int64_t  startQpc         = 0;
+        int64_t  nextTargetQpc    = 0;
+        int64_t  lastEventQpc     = 0;
+        Millis   expectedInterval{0.0};
+        uint64_t events           = 0;
+        size_t   seqIndex         = 0;
+    };
+
+    [[nodiscard]] std::shared_ptr<const EngineSettings> Settings() const noexcept {
+        return m_settings.load(std::memory_order_acquire);
+    }
+
     void WorkerLoop(std::stop_token st);
-    void RunCpsCycle(const CpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus,
-                     int64_t& nextTargetQpc, int64_t& lastEventQpc, double& expectedIntervalMs, uint64_t& sessionEvents);
-    void RunKpsCycle(const KpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus,
-                     int64_t& nextTargetQpc, int64_t& lastEventQpc, double& expectedIntervalMs, uint64_t& sessionEvents, size_t& seqIndex);
+    void RunCpsCycle(const CpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus, uint64_t eventBudget, SessionState& session);
+    void RunKpsCycle(const KpsConfig& cfg, bool hybridSpin, bool stopOnSelfFocus, SessionState& session);
 
     [[nodiscard]] bool IsSelfWindowBlocking(bool checkCursorForMouse, CursorMode cursorMode) const noexcept;
     [[nodiscard]] bool MatchesTargetWindowLock(const GlobalSettings& gs, HWND& cachedHwnd, bool& cachedMatch) const noexcept;
@@ -78,11 +100,8 @@ private:
     HANDLE m_wakeEvent   = nullptr;
     HANDLE m_cancelEvent = nullptr;
 
-    mutable std::mutex m_cfgMutex;
-    OperatingMode      m_mode = OperatingMode::CPS;
-    CpsConfig          m_cps{};
-    KpsConfig          m_kps{};
-    GlobalSettings     m_settings{};
+    // Lock-free for the worker: one atomic load per cycle instead of copying vectors/strings under a mutex
+    std::atomic<std::shared_ptr<const EngineSettings>> m_settings{std::make_shared<const EngineSettings>()};
 
     std::mutex                       m_cbMutex;
     std::function<void(EngineState)> m_stateCallback;

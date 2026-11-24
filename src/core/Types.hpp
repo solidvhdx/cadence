@@ -145,6 +145,7 @@ struct AppConfig {
     KpsConfig            kps{};
     GlobalSettings       settings{};
     std::vector<Profile> profiles{};
+    int                  loadedVersion = 0; // config.json format version this was loaded from (0 = built-in defaults)
 };
 
 struct TelemetrySnapshot {

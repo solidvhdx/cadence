@@ -61,6 +61,26 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\bench_timing.exe
 ```
 
+Single tests run by name (`.\build\Release\test_core.exe --list` shows all of them).
+
+Extra checks (all built into MSVC, also run by CI):
+
+```powershell
+# AddressSanitizer
+cmake -B build-asan -A x64 -DCADENCE_ENABLE_ASAN=ON
+cmake --build build-asan --config RelWithDebInfo --target test_core
+ctest --test-dir build-asan -C RelWithDebInfo --output-on-failure
+
+# libFuzzer for the JSON / config / release parsers
+cmake -B build-fuzz -A x64 -DCADENCE_BUILD_FUZZERS=ON
+cmake --build build-fuzz --config RelWithDebInfo --target fuzz_json fuzz_config
+.\build-fuzz\RelWithDebInfo\fuzz_config.exe -max_total_time=60
+
+# Static analysis (/analyze)
+cmake -B build-analyze -A x64 -DCADENCE_ENABLE_ANALYZE=ON
+cmake --build build-analyze --config Debug
+```
+
 ## License
 
 Free to use, modify, and share for non-commercial purposes. Selling or commercial use is not permitted. See [LICENSE](LICENSE) for details.

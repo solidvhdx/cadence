@@ -1,5 +1,6 @@
 #include "core/UpdateChecker.hpp"
 #include "core/JsonParser.hpp"
+#include "core/StringUtil.hpp"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -113,15 +114,6 @@ public:
 private:
     BCRYPT_HASH_HANDLE m_h = nullptr;
 };
-
-std::wstring Utf8ToWide(std::string_view s) {
-    if (s.empty()) return {};
-    const int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (len <= 0) return {};
-    std::wstring out(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), len);
-    return out;
-}
 
 [[nodiscard]] bool ConstantTimeEquals(std::string_view a, std::string_view b) noexcept {
     if (a.size() != b.size()) return false;
@@ -358,7 +350,49 @@ bool HttpGetToBuffer(const std::wstring& host,
     return !outBody.empty();
 }
 
+constexpr size_t kMaxReleaseNotesBytes = 4096;
+
+// Keeps release notes displayable: CRLF -> LF, tabs -> spaces, other control characters dropped,
+// capped at a UTF-8 character boundary.
+std::string SanitizeReleaseNotes(std::string_view raw) {
+    std::string out;
+    out.reserve(std::min(raw.size(), kMaxReleaseNotesBytes + 1));
+    for (const char ch : raw) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c == '\r') continue;
+        if (c == '\t') { out.push_back(' '); continue; }
+        if ((c < 0x20 && c != '\n') || c == 0x7F) continue;
+        out.push_back(ch);
+        if (out.size() > kMaxReleaseNotesBytes) break;
+    }
+    if (out.size() > kMaxReleaseNotesBytes) {
+        size_t cut = kMaxReleaseNotesBytes;
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) {
+            --cut; // never split a multi-byte UTF-8 sequence
+        }
+        out.resize(cut);
+    }
+    return out;
+}
+
 } // namespace
+
+std::wstring_view DescribeUpdateError(UpdateError error) noexcept {
+    switch (error) {
+        case UpdateError::InvalidRequest: return L"Invalid update data";
+        case UpdateError::Cancelled:      return L"Update cancelled";
+        case UpdateError::Network:        return L"Network error during update";
+        case UpdateError::HttpStatus:     return L"GitHub refused the download";
+        case UpdateError::TooLarge:       return L"Update file is too large";
+        case UpdateError::Incomplete:     return L"Download was incomplete";
+        case UpdateError::DiskWrite:      return L"Could not write the update file";
+        case UpdateError::HashMismatch:   return L"Update failed the SHA-256 check";
+        case UpdateError::NotExecutable:  return L"Update is not a valid Windows program";
+        case UpdateError::ReplaceFailed:  return L"Cadence folder is not writable";
+        case UpdateError::LaunchFailed:   return L"New version did not start";
+    }
+    return L"Update failed";
+}
 
 std::optional<SemVer> UpdateChecker::ParseSemVer(std::string_view tag) noexcept {
     while (!tag.empty() && (tag.front() == ' ' || tag.front() == '\t')) {
@@ -484,6 +518,10 @@ std::optional<ReleaseInfo> UpdateChecker::ParseGitHubReleaseJson(std::string_vie
         info.releaseUrl = "https://github.com/solidvhdx/cadence/releases/latest";
     }
 
+    if (const JsonValue* bodyVal = root.Find("body"); bodyVal && bodyVal->IsString()) {
+        info.releaseNotes = SanitizeReleaseNotes(bodyVal->AsString());
+    }
+
     // Structurally locate the exact "Cadence.exe" asset and require its SHA-256 digest
     const JsonValue* assetsVal = root.Find("assets");
     if (assetsVal && assetsVal->IsArray()) {
@@ -548,25 +586,30 @@ std::optional<ReleaseInfo> UpdateChecker::CheckForUpdate() {
     return info;
 }
 
-bool UpdateChecker::DownloadBinary(const std::string& url,
-                                   const std::filesystem::path& destPath,
-                                   std::string_view expectedSha256Hex,
-                                   const DownloadProgressCallback& onProgress,
-                                   const std::atomic<bool>* cancelFlag) {
+std::expected<void, UpdateError> UpdateChecker::DownloadBinary(const std::string& url,
+                                                               const std::filesystem::path& destPath,
+                                                               std::string_view expectedSha256Hex,
+                                                               const DownloadProgressCallback& onProgress,
+                                                               const std::atomic<bool>* cancelFlag) {
     auto isCancelled = [&]() noexcept -> bool {
         return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
     };
 
+    using Fail = std::unexpected<UpdateError>;
+    if (isCancelled()) {
+        return Fail(UpdateError::Cancelled);
+    }
+
     const auto expectedSha = NormalizeSha256Hex(expectedSha256Hex);
-    if (!expectedSha || isCancelled() || destPath.empty() ||
+    if (!expectedSha || destPath.empty() ||
         !url.starts_with("https://github.com/solidvhdx/cadence/releases/download/") ||
         !url.ends_with("/Cadence.exe")) {
-        return false;
+        return Fail(UpdateError::InvalidRequest);
     }
 
     // Refuse pre-existing files or pre-planted symlinks / reparse points
     if (GetFileAttributesW(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return false;
+        return Fail(UpdateError::InvalidRequest);
     }
 
     const std::wstring wideUrl = Utf8ToWide(url);
@@ -576,7 +619,7 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
     uc.dwUrlPathLength   = static_cast<DWORD>(-1);
     uc.dwExtraInfoLength = static_cast<DWORD>(-1);
     if (!WinHttpCrackUrl(wideUrl.c_str(), static_cast<DWORD>(wideUrl.size()), 0, &uc)) {
-        return false;
+        return Fail(UpdateError::InvalidRequest);
     }
 
     const std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
@@ -588,41 +631,46 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
     const std::wstring ua = L"Cadence/" + Utf8ToWide(CADENCE_VERSION_STR);
     WinHttpHandle session(WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session || isCancelled()) return false;
+    if (isCancelled()) return Fail(UpdateError::Cancelled);
+    if (!session) return Fail(UpdateError::Network);
 
     EnforceModernTls(session.Get());
     WinHttpSetTimeouts(session.Get(), 5000, 6000, 10000, 15000);
 
     WinHttpHandle connect(WinHttpConnect(session.Get(), host.c_str(), uc.nPort ? uc.nPort : INTERNET_DEFAULT_HTTPS_PORT, 0));
-    if (!connect || isCancelled()) return false;
+    if (isCancelled()) return Fail(UpdateError::Cancelled);
+    if (!connect) return Fail(UpdateError::Network);
 
     WinHttpHandle request(WinHttpOpenRequest(connect.Get(), L"GET", path.c_str(),
                                              nullptr, WINHTTP_NO_REFERER,
                                              WINHTTP_DEFAULT_ACCEPT_TYPES,
                                              WINHTTP_FLAG_SECURE));
-    if (!request || isCancelled()) return false;
+    if (isCancelled()) return Fail(UpdateError::Cancelled);
+    if (!request) return Fail(UpdateError::Network);
 
     // Allow HTTPS -> HTTPS redirects (GitHub redirects release downloads to objects.githubusercontent.com)
     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(request.Get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     if (!WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        return false;
+        return Fail(isCancelled() ? UpdateError::Cancelled : UpdateError::Network);
     }
-    if (isCancelled()) return false;
+    if (isCancelled()) return Fail(UpdateError::Cancelled);
     if (!WinHttpReceiveResponse(request.Get(), nullptr)) {
-        return false;
+        return Fail(isCancelled() ? UpdateError::Cancelled : UpdateError::Network);
     }
-    if (isCancelled()) return false;
+    if (isCancelled()) return Fail(UpdateError::Cancelled);
 
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
     if (!WinHttpQueryHeaders(request.Get(),
                              WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX,
-                             &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) ||
-        statusCode != 200) {
-        return false;
+                             &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+        return Fail(UpdateError::Network);
+    }
+    if (statusCode != 200) {
+        return Fail(UpdateError::HttpStatus);
     }
 
     // Query optional Content-Length header so truncated downloads are always rejected
@@ -659,18 +707,18 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                                       nullptr));
     if (!outFile) {
-        return false;
+        return Fail(UpdateError::DiskWrite);
     }
 
-    auto cleanupFail = [&]() -> bool {
+    auto cleanupFail = [&](UpdateError reason) -> std::expected<void, UpdateError> {
         outFile.Reset();
         std::error_code ec;
         std::filesystem::remove(destPath, ec);
-        return false;
+        return Fail(reason);
     };
 
     if (!IsRegularSingleLinkFile(outFile.Get())) {
-        return cleanupFail();
+        return cleanupFail(UpdateError::DiskWrite);
     }
 
     std::array<unsigned char, 16384> buf{};
@@ -678,33 +726,33 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
 
     for (;;) {
         if (isCancelled()) {
-            return cleanupFail();
+            return cleanupFail(UpdateError::Cancelled);
         }
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(request.Get(), &avail)) {
-            return cleanupFail(); // Mid-stream network error: never accept partial binary!
+            return cleanupFail(UpdateError::Network); // Mid-stream network error: never accept partial binary!
         }
         if (avail == 0) {
             break; // Clean EOF
         }
         while (avail > 0) {
             if (isCancelled()) {
-                return cleanupFail();
+                return cleanupFail(UpdateError::Cancelled);
             }
             const DWORD toRead = static_cast<DWORD>(std::min<size_t>(avail, buf.size()));
             DWORD read = 0;
             if (!WinHttpReadData(request.Get(), buf.data(), toRead, &read)) {
-                return cleanupFail();
+                return cleanupFail(UpdateError::Network);
             }
             if (read == 0) {
                 break;
             }
             totalBytes += read;
             if (totalBytes > kMaxExeBytes) {
-                return cleanupFail();
+                return cleanupFail(UpdateError::TooLarge);
             }
             if (!WriteAllToHandle(outFile.Get(), buf.data(), read)) {
-                return cleanupFail();
+                return cleanupFail(UpdateError::DiskWrite);
             }
             avail -= read;
             if (onProgress) {
@@ -713,24 +761,27 @@ bool UpdateChecker::DownloadBinary(const std::string& url,
         }
     }
 
-    if (isCancelled() || !FlushFileBuffers(outFile.Get())) {
-        return cleanupFail();
+    if (isCancelled()) {
+        return cleanupFail(UpdateError::Cancelled);
+    }
+    if (!FlushFileBuffers(outFile.Get())) {
+        return cleanupFail(UpdateError::DiskWrite);
     }
     if (expectedContentLength && totalBytes != *expectedContentLength) {
-        return cleanupFail();
+        return cleanupFail(UpdateError::Incomplete);
     }
 
     // Verify both cryptographic SHA-256 and x64 PE64 structure on the SAME exclusive handle before closing
     const auto actualSha = ComputeSha256FromHandle(outFile.Get());
     if (!actualSha || !ConstantTimeEquals(*actualSha, *expectedSha)) {
-        return cleanupFail();
+        return cleanupFail(UpdateError::HashMismatch);
     }
     if (!VerifyPe64FromHandle(outFile.Get())) {
-        return cleanupFail();
+        return cleanupFail(UpdateError::NotExecutable);
     }
 
     outFile.Reset();
-    return true;
+    return {};
 }
 
 bool UpdateChecker::VerifyPe64Binary(const std::filesystem::path& exePath) noexcept {
@@ -770,11 +821,12 @@ void UpdateChecker::CleanupOldBinary() noexcept {
     }
 }
 
-bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath,
-                                           std::string_view expectedSha256Hex) {
+std::expected<void, UpdateError> UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePath,
+                                                                       std::string_view expectedSha256Hex) {
+    using Fail = std::unexpected<UpdateError>;
     const auto expectedSha = NormalizeSha256Hex(expectedSha256Hex);
     if (!expectedSha) {
-        return false;
+        return Fail(UpdateError::InvalidRequest);
     }
 
     auto moveWithRetry = [](const std::filesystem::path& from, const std::filesystem::path& to) -> bool {
@@ -794,13 +846,13 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
     const DWORD newAttrs = GetFileAttributesW(newExePath.c_str());
     if (newAttrs == INVALID_FILE_ATTRIBUTES ||
         (newAttrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
-        return false;
+        return Fail(UpdateError::InvalidRequest);
     }
 
     std::error_code ec;
     const auto curExe = CurrentExePath();
     if (curExe.empty()) {
-        return false;
+        return Fail(UpdateError::ReplaceFailed);
     }
 
     std::filesystem::path oldExe = curExe;
@@ -811,13 +863,13 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
 
     // Windows allows renaming a currently running executable in-place!
     if (!moveWithRetry(curExe, oldExe)) {
-        return false;
+        return Fail(UpdateError::ReplaceFailed);
     }
 
     if (!moveWithRetry(newExePath, curExe)) {
         // Roll back immediately so the user never loses their working binary
         moveWithRetry(oldExe, curExe);
-        return false;
+        return Fail(UpdateError::ReplaceFailed);
     }
 
     // Zero-TOCTOU lock: open the final binary with GENERIC_READ + FILE_SHARE_READ only (blocks all
@@ -830,17 +882,23 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
                                         OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                                         nullptr));
-    bool verified = false;
-    if (lockedExe && IsRegularSingleLinkFile(lockedExe.Get()) && VerifyPe64FromHandle(lockedExe.Get())) {
+    std::optional<UpdateError> verifyError;
+    if (!lockedExe || !IsRegularSingleLinkFile(lockedExe.Get())) {
+        verifyError = UpdateError::ReplaceFailed;
+    } else if (!VerifyPe64FromHandle(lockedExe.Get())) {
+        verifyError = UpdateError::NotExecutable;
+    } else {
         const auto finalSha = ComputeSha256FromHandle(lockedExe.Get());
-        verified = finalSha && ConstantTimeEquals(*finalSha, *expectedSha);
+        if (!finalSha || !ConstantTimeEquals(*finalSha, *expectedSha)) {
+            verifyError = UpdateError::HashMismatch;
+        }
     }
 
-    if (!verified) {
+    if (verifyError) {
         lockedExe.Reset();
         std::filesystem::remove(curExe, ec);
         moveWithRetry(oldExe, curExe);
-        return false;
+        return Fail(*verifyError);
     }
 
     std::wstring cmdLine = L"\"" + curExe.wstring() + L"\" --updated";
@@ -852,13 +910,13 @@ bool UpdateChecker::ApplyUpdateAndRelaunch(const std::filesystem::path& newExePa
         // Roll back if the new binary failed to launch
         moveWithRetry(curExe, newExePath);
         moveWithRetry(oldExe, curExe);
-        return false;
+        return Fail(UpdateError::LaunchFailed);
     }
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     lockedExe.Reset();
-    return true;
+    return {};
 }
 
 } // namespace cadence

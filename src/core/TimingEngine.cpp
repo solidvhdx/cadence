@@ -60,7 +60,7 @@ TimingEngine::TimingEngine() {
 
 void TimingEngine::CalibrateSpinGuard() noexcept {
     if (!m_timer || !m_highResSupported) {
-        m_spinGuardUs = 450.0;
+        m_spinGuard = Micros{450.0};
         return;
     }
 
@@ -68,20 +68,20 @@ void TimingEngine::CalibrateSpinGuard() noexcept {
     LARGE_INTEGER due{};
     due.QuadPart = -10'000; // 1.0 ms in 100ns units
 
-    double maxOvershootUs = 0.0;
+    Micros maxOvershoot{0.0};
     for (int i = 0; i < 6; ++i) {
         const int64_t t0 = NowQpc();
         if (SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE)) {
             WaitForSingleObject(m_timer, INFINITE);
-            const double actualUs = QpcToMicroseconds(NowQpc() - t0);
+            const Micros actual = QpcToMicros(NowQpc() - t0);
             if (i >= 1) { // Skip first warm-up sample
-                const double overshoot = std::max(0.0, actualUs - 1000.0);
-                maxOvershootUs = std::max(maxOvershootUs, overshoot);
+                const Micros overshoot = std::max(Micros{0.0}, actual - Millis{1.0});
+                maxOvershoot = std::max(maxOvershoot, overshoot);
             }
         }
     }
     // Keep guard tight enough to avoid CPU waste & quantum preemption, wide enough to absorb overshoot
-    m_spinGuardUs = std::clamp(maxOvershootUs + 150.0, 320.0, 620.0);
+    m_spinGuard = std::clamp(maxOvershoot + Micros{150.0}, Micros{320.0}, Micros{620.0});
 }
 
 TimingEngine::~TimingEngine() {
@@ -114,16 +114,16 @@ int64_t TimingEngine::NowQpc() const noexcept {
     return now.QuadPart;
 }
 
-int64_t TimingEngine::MicrosecondsToQpc(double us) const noexcept {
-    return static_cast<int64_t>((us * static_cast<double>(m_qpcFreq)) / 1'000'000.0);
+int64_t TimingEngine::ToQpcTicks(Micros duration) const noexcept {
+    return static_cast<int64_t>((duration.count() * static_cast<double>(m_qpcFreq)) / 1'000'000.0);
 }
 
-double TimingEngine::QpcToMilliseconds(int64_t deltaQpc) const noexcept {
-    return (static_cast<double>(deltaQpc) * 1000.0) / static_cast<double>(m_qpcFreq);
+Millis TimingEngine::QpcToMillis(int64_t deltaQpc) const noexcept {
+    return Millis{(static_cast<double>(deltaQpc) * 1000.0) / static_cast<double>(m_qpcFreq)};
 }
 
-double TimingEngine::QpcToMicroseconds(int64_t deltaQpc) const noexcept {
-    return (static_cast<double>(deltaQpc) * 1'000'000.0) / static_cast<double>(m_qpcFreq);
+Micros TimingEngine::QpcToMicros(int64_t deltaQpc) const noexcept {
+    return Micros{(static_cast<double>(deltaQpc) * 1'000'000.0) / static_cast<double>(m_qpcFreq)};
 }
 
 bool TimingEngine::WaitUntil(int64_t targetQpc,
@@ -139,15 +139,16 @@ bool TimingEngine::WaitUntil(int64_t targetQpc,
         return true;
     }
 
-    const double remainingUs = QpcToMicroseconds(targetQpc - now);
-    const double guardUs     = hybridSpin ? m_spinGuardUs : 0.0;
+    const Micros remaining = QpcToMicros(targetQpc - now);
+    const Micros guard     = hybridSpin ? m_spinGuard : Micros{0.0};
 
     // 1. Coarse OS wait using High-Resolution Waitable Timer (0% CPU)
-    if (m_timer && remainingUs > guardUs + 150.0) {
-        const double sleepUs = remainingUs - guardUs;
+    if (m_timer && remaining > guard + Micros{150.0}) {
+        const Micros sleepFor = remaining - guard;
         // Relative time in 100-nanosecond intervals (negative value)
+        using HundredNs = std::chrono::duration<double, std::ratio<1, 10'000'000>>;
         LARGE_INTEGER dueTime{};
-        dueTime.QuadPart = -static_cast<LONGLONG>(sleepUs * 10.0);
+        dueTime.QuadPart = -static_cast<LONGLONG>(HundredNs{sleepFor}.count());
 
         if (SetWaitableTimer(m_timer, &dueTime, 0, nullptr, nullptr, FALSE)) {
             if (cancelEvent) {
@@ -181,14 +182,14 @@ bool TimingEngine::WaitUntil(int64_t targetQpc,
     return !abortFlag.load(std::memory_order_acquire);
 }
 
-bool TimingEngine::WaitForMs(double ms,
-                             HANDLE cancelEvent,
-                             const std::atomic<bool>& abortFlag,
-                             bool hybridSpin) const noexcept {
-    if (ms <= 0.0) {
+bool TimingEngine::WaitFor(Millis duration,
+                           HANDLE cancelEvent,
+                           const std::atomic<bool>& abortFlag,
+                           bool hybridSpin) const noexcept {
+    if (duration <= Millis{0.0}) {
         return !abortFlag.load(std::memory_order_acquire);
     }
-    const int64_t target = NowQpc() + MicrosecondsToQpc(ms * 1000.0);
+    const int64_t target = NowQpc() + ToQpcTicks(duration);
     return WaitUntil(target, cancelEvent, abortFlag, hybridSpin);
 }
 
@@ -209,16 +210,16 @@ double TimingEngine::NextUniform01() noexcept {
     return static_cast<double>((NextRandomU64() >> 11) + 1ULL) * (1.0 / 9007199254740992.0);
 }
 
-double TimingEngine::SampleJitterMs(double maxJitterMs) noexcept {
-    if (maxJitterMs <= 0.0) {
-        return 0.0;
+Millis TimingEngine::SampleJitter(Millis maxJitter) noexcept {
+    if (maxJitter <= Millis{0.0}) {
+        return Millis{0.0};
     }
-    // Box-Muller Gaussian with sigma = maxJitterMs / 2.5, clamped to [-maxJitterMs, +maxJitterMs]
+    // Box-Muller Gaussian with sigma = maxJitter / 2.5, clamped to [-maxJitter, +maxJitter]
     const double u1 = NextUniform01();
     const double u2 = NextUniform01();
     const double z0 = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * std::numbers::pi * u2);
-    const double sample = z0 * (maxJitterMs / 2.5);
-    return std::clamp(sample, -maxJitterMs, maxJitterMs);
+    const Millis sample = z0 * (maxJitter / 2.5);
+    return std::clamp(sample, -maxJitter, maxJitter);
 }
 
 } // namespace cadence

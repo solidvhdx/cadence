@@ -27,14 +27,14 @@ BenchResult RunCase(cadence::TimingEngine& timing,
                     double targetRateHz,
                     int iterations) {
     cadence::TimingEngine::SetPowerThrottlingDisabled(disableThrottle);
-    timing.SetSpinGuardUs(spinGuardUs);
+    timing.SetSpinGuard(cadence::Micros{spinGuardUs});
 
     cadence::PerformanceMonitor perf;
     std::atomic<bool> abort{false};
     HANDLE cancelEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     const double targetMs = 1000.0 / targetRateHz;
-    const int64_t stepQpc = timing.MicrosecondsToQpc(targetMs * 1000.0);
+    const int64_t stepQpc = timing.ToQpcTicks(cadence::Millis{targetMs});
 
     // Warm-up
     int64_t nextQpc = timing.NowQpc() + stepQpc;
@@ -54,11 +54,11 @@ BenchResult RunCase(cadence::TimingEngine& timing,
     for (int i = 0; i < iterations; ++i) {
         timing.WaitUntil(nextQpc, cancelEv, abort, hybridSpin);
         const int64_t now = timing.NowQpc();
-        const double dtMs = timing.QpcToMilliseconds(now - prevQpc);
+        const double dtMs = timing.QpcToMillis(now - prevQpc).count();
         const double errUs = std::abs(dtMs - targetMs) * 1000.0;
         actualMs.push_back(dtMs);
         absErrUs.push_back(errUs);
-        perf.RecordEvent(now, targetMs, dtMs);
+        perf.RecordEvent(now, cadence::Millis{targetMs}, cadence::Millis{dtMs});
         prevQpc = now;
         nextQpc += stepQpc;
     }

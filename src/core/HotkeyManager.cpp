@@ -59,9 +59,18 @@ void HotkeyManager::SetBindings(const HotkeyBinding& cpsHotkey,
     RegisterPanicFallback();
 }
 
+void HotkeyManager::SetPanicFallbackEnabled(bool enabled) {
+    if (m_panicFallbackWanted == enabled) {
+        return;
+    }
+    m_panicFallbackWanted = enabled;
+    RegisterPanicFallback();
+}
+
 void HotkeyManager::RegisterPanicFallback() {
     UnregisterPanicFallback();
-    if (m_hwnd && m_panicBinding.source == HotkeySource::Keyboard && m_panicBinding.code != 0) {
+    if (m_panicFallbackWanted && m_hwnd &&
+        m_panicBinding.source == HotkeySource::Keyboard && m_panicBinding.code != 0) {
         m_panicRegistered = RegisterHotKey(m_hwnd, kPanicHotkeyId, MOD_NOREPEAT, m_panicBinding.code) != FALSE;
     }
 }

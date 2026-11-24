@@ -212,7 +212,23 @@ bool ReadProfileObj(const JsonObject& o, Profile& p) {
     return true;
 }
 
+// Upgrades an older config object in place, one step per format version, and returns the new version.
+// Example for a future bump to v2:  if (version < 2) { /* convert v1 fields */ version = 2; }
+int MigrateConfig(JsonObject& /*config*/, int version) {
+    return version;
+}
+
 } // namespace
+
+std::wstring_view DescribeConfigLoadError(ConfigLoadError error) noexcept {
+    switch (error) {
+        case ConfigLoadError::NotFound:    return L"No settings file yet";
+        case ConfigLoadError::TooLarge:    return L"Settings file is too large";
+        case ConfigLoadError::ReadFailed:  return L"Settings file could not be read";
+        case ConfigLoadError::ParseFailed: return L"Settings file is damaged";
+    }
+    return L"Settings file could not be loaded";
+}
 
 std::filesystem::path ConfigManager::DefaultConfigPath() {
     PWSTR appData = nullptr;
@@ -250,7 +266,8 @@ std::string ConfigManager::Serialize(const AppConfig& config) {
     profilesJson += "]";
 
     return std::format(
-        "{{\n  \"version\": 1,\n  \"activeMode\": {},\n  \"activeProfileId\": {},\n  \"cps\": {},\n  \"kps\": {},\n  \"settings\": {},\n  \"profiles\": [\n    {}\n  ]\n}}\n",
+        "{{\n  \"version\": {},\n  \"activeMode\": {},\n  \"activeProfileId\": {},\n  \"cps\": {},\n  \"kps\": {},\n  \"settings\": {},\n  \"profiles\": [\n    {}\n  ]\n}}\n",
+        kConfigVersion,
         static_cast<int>(config.activeMode),
         EscapeJson(config.activeProfileId),
         WriteCps(config.cps),
@@ -266,7 +283,12 @@ bool ConfigManager::Deserialize(const std::string& jsonText, AppConfig& outConfi
     if (!parser.Parse(root) || !root.IsObject()) {
         return false;
     }
-    const auto& o = root.AsObject();
+    auto& o = std::get<JsonObject>(root.data);
+
+    // Files without a version field predate versioning and use the v1 layout
+    const int fileVersion = std::max(1, GetNum<int>(o, "version", 1));
+    outConfig.loadedVersion = (fileVersion < kConfigVersion) ? MigrateConfig(o, fileVersion) : fileVersion;
+
     outConfig.activeMode      = static_cast<OperatingMode>(std::clamp(GetNum<int>(o, "activeMode", 0), 0, 1));
     outConfig.activeProfileId = GetStr(o, "activeProfileId", "default");
 
@@ -316,19 +338,42 @@ bool ConfigManager::DeserializeProfile(const std::string& jsonText, Profile& out
     return ReadProfileObj(root.AsObject(), outProfile);
 }
 
-bool ConfigManager::LoadFromFile(const std::filesystem::path& path, AppConfig& outConfig) {
+std::expected<void, ConfigLoadError> ConfigManager::LoadFromFile(const std::filesystem::path& path, AppConfig& outConfig) {
     constexpr uintmax_t kMaxConfigBytes = 2 * 1024 * 1024; // 2 MB cap against memory DoS
     std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return std::unexpected(ec ? ConfigLoadError::ReadFailed : ConfigLoadError::NotFound);
+    }
     const auto sz = std::filesystem::file_size(path, ec);
-    if (ec || sz == 0 || sz > kMaxConfigBytes) return false;
+    if (ec) return std::unexpected(ConfigLoadError::ReadFailed);
+    if (sz == 0) return std::unexpected(ConfigLoadError::ParseFailed);
+    if (sz > kMaxConfigBytes) return std::unexpected(ConfigLoadError::TooLarge);
 
     std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
+    if (!in) return std::unexpected(ConfigLoadError::ReadFailed);
     std::string buf(static_cast<size_t>(sz), '\0');
     in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-    if (!in && !in.eof()) return false;
+    if (!in && !in.eof()) return std::unexpected(ConfigLoadError::ReadFailed);
     buf.resize(static_cast<size_t>(in.gcount()));
-    return Deserialize(buf, outConfig);
+
+    // Parse into a copy so a damaged file never leaves a half-applied config behind
+    AppConfig parsed = outConfig;
+    if (!Deserialize(buf, parsed)) {
+        return std::unexpected(ConfigLoadError::ParseFailed);
+    }
+    outConfig = std::move(parsed);
+    return {};
+}
+
+std::optional<std::filesystem::path> ConfigManager::BackupFile(const std::filesystem::path& path) {
+    std::filesystem::path backup = path;
+    backup += L".bak";
+    std::error_code ec;
+    std::filesystem::copy_file(path, backup, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return backup;
 }
 
 bool ConfigManager::SaveToFile(const std::filesystem::path& path, const AppConfig& config) {
@@ -336,7 +381,8 @@ bool ConfigManager::SaveToFile(const std::filesystem::path& path, const AppConfi
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
     }
-    const auto tmpPath = path.wstring() + L".tmp";
+    std::filesystem::path tmpPath = path;
+    tmpPath += L".tmp";
     {
         std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
         if (!out) return false;
