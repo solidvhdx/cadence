@@ -183,6 +183,7 @@ private:
     bool         m_editingRate  = false;
     std::wstring m_rateEditBuf;
     bool         m_namingProfile = false;
+    bool         m_systemDialogOpen = false; // File/message dialogs: mode hotkeys must not start the engine into them
     std::wstring m_profileNameBuf;
 
     D2D1_RECT_F m_mainSliderRc{};

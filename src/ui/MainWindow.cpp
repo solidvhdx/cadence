@@ -92,6 +92,69 @@ std::wstring LimitLabel(RepeatLimitMode m) {
     return L"Unlimited";
 }
 
+// Keys that let a shared profile leave the game: open Start / context menus or confirm typed commands
+bool IsRiskyMacroKey(uint16_t vk) noexcept {
+    switch (vk) {
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_APPS:
+        case VK_RETURN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ProfileUsesRiskyKeys(const Profile& p) noexcept {
+    if (p.mode != OperatingMode::KPS) {
+        return false; // ActivateProfile only applies the KPS part of KPS profiles
+    }
+    if (p.kps.inputMode == KeyInputMode::Sequence) {
+        return std::any_of(p.kps.sequenceVks.begin(), p.kps.sequenceVks.end(), IsRiskyMacroKey);
+    }
+    return IsRiskyMacroKey(p.kps.targetVk);
+}
+
+// Plain-text summary of what an imported profile will press, shown before it is added
+std::wstring DescribeImportedProfile(const Profile& p, bool risky) {
+    std::wstring name = Utf8ToWide(p.name);
+    if (name.size() > 48) {
+        name.resize(48);
+        if (IS_HIGH_SURROGATE(name.back())) name.pop_back();
+        name += L"…";
+    }
+
+    std::wstring text = L"Name: " + name + L"\n";
+    if (p.mode == OperatingMode::CPS) {
+        static constexpr const wchar_t* kButtons[] = {L"Left", L"Right", L"Middle"};
+        text += std::format(L"Mode: Mouse, {:.1f} clicks per second ({} button)\n",
+                            p.cps.rateCps, kButtons[std::min<size_t>(static_cast<size_t>(p.cps.button), 2)]);
+    } else {
+        text += std::format(L"Mode: Keyboard, {:.1f} presses per second\n", p.kps.rateKps);
+        std::wstring keys;
+        if (p.kps.inputMode == KeyInputMode::Sequence) {
+            for (size_t i = 0; i < p.kps.sequenceVks.size(); ++i) {
+                if (i > 0) keys += L" → ";
+                keys += FormatVkName(p.kps.sequenceVks[i]);
+            }
+        } else {
+            if (p.kps.modCtrl)  keys += L"Ctrl + ";
+            if (p.kps.modShift) keys += L"Shift + ";
+            if (p.kps.modAlt)   keys += L"Alt + ";
+            keys += FormatVkName(p.kps.targetVk);
+        }
+        text += L"Keys: " + keys + L"\n";
+    }
+    text += L"Hotkey: " + FormatHotkey(p.mode == OperatingMode::CPS ? p.cps.hotkey : p.kps.hotkey) + L"\n";
+
+    if (risky) {
+        text += L"\nWARNING: This profile presses Windows / Menu / Enter keys. A profile from someone else "
+                L"can use them to open programs and type commands on your PC. Only import it if you trust the source.\n";
+    }
+    text += L"\nImport and activate this profile?";
+    return text;
+}
+
 } // namespace
 
 MainWindow::MainWindow() {
@@ -299,19 +362,19 @@ bool MainWindow::Create(HINSTANCE hInstance, bool previewUpdate) {
 
     HotkeyCallbacks cbs{};
     cbs.onCpsPress   = [this]() {
-        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        if (m_editingRate || m_namingProfile || m_updateModalOpen || m_systemDialogOpen) return;
         m_engine.HandleHotkeyPress(OperatingMode::CPS);
     };
     cbs.onCpsRelease = [this]() {
-        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        if (m_editingRate || m_namingProfile || m_updateModalOpen || m_systemDialogOpen) return;
         m_engine.HandleHotkeyRelease(OperatingMode::CPS);
     };
     cbs.onKpsPress   = [this]() {
-        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        if (m_editingRate || m_namingProfile || m_updateModalOpen || m_systemDialogOpen) return;
         m_engine.HandleHotkeyPress(OperatingMode::KPS);
     };
     cbs.onKpsRelease = [this]() {
-        if (m_editingRate || m_namingProfile || m_updateModalOpen) return;
+        if (m_editingRate || m_namingProfile || m_updateModalOpen || m_systemDialogOpen) return;
         m_engine.HandleHotkeyRelease(OperatingMode::KPS);
     };
     cbs.onPanicStop  = [this]() {
@@ -2482,6 +2545,9 @@ void MainWindow::CommitProfileName() {
 }
 
 void MainWindow::BeginKeyCapture(CaptureKind kind) {
+    // While capturing, every key (including the Emergency Kill hotkey) is consumed as the new binding,
+    // so the engine must never keep clicking/pressing during capture.
+    m_engine.Stop();
     m_captureKind = kind;
     const bool allowMouse = (kind == CaptureKind::ModeHotkey || kind == CaptureKind::PanicHotkey);
     m_hotkeys.BeginCapture(allowMouse, [this, kind](HotkeyBinding hk) {
@@ -2498,7 +2564,7 @@ void MainWindow::BeginKeyCapture(CaptureKind kind) {
         } else if (kind == CaptureKind::KpsTargetKey && hk.source == HotkeySource::Keyboard) {
             m_config.kps.targetVk = hk.code;
         } else if (kind == CaptureKind::KpsSeqAppend && hk.source == HotkeySource::Keyboard) {
-            if (m_config.kps.sequenceVks.size() < 12) {
+            if (m_config.kps.sequenceVks.size() < kMaxSequenceKeys) {
                 m_config.kps.sequenceVks.push_back(hk.code);
             }
         } else if (kind == CaptureKind::PanicHotkey) {
@@ -2553,7 +2619,11 @@ void MainWindow::ExportActiveProfileDialog() {
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrDefExt = L"json";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetSaveFileNameW(&ofn)) {
+    m_engine.Stop();
+    m_systemDialogOpen = true;
+    const BOOL picked = GetSaveFileNameW(&ofn);
+    m_systemDialogOpen = false;
+    if (picked) {
         if (m_profiles->ExportProfile(m_config.activeProfileId, fileBuf)) {
             ShowToast(L"Profile exported", false);
         } else {
@@ -2571,17 +2641,39 @@ void MainWindow::ImportProfileDialog() {
     ofn.lpstrFile   = fileBuf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&ofn)) {
-        if (m_profiles->ImportProfile(fileBuf)) {
-            SyncEngineAndHotkeys();
-            UpdateWindowSizeForLayout();
-            SaveConfigNow();
-            StartAnimTimer();
-            ShowToast(L"Profile imported", false);
-        } else {
-            ShowToast(L"Invalid profile file", true);
-        }
+    m_engine.Stop();
+    m_systemDialogOpen = true;
+    const BOOL picked = GetOpenFileNameW(&ofn);
+    m_systemDialogOpen = false;
+    if (!picked) {
+        return;
     }
+
+    Profile imported{};
+    if (!ProfileManager::ReadProfileFile(fileBuf, imported)) {
+        ShowToast(L"Invalid profile file", true);
+        return;
+    }
+
+    // An imported profile is a click/key macro from a possibly untrusted source:
+    // show exactly what it will press and only add + activate it after explicit confirmation.
+    const bool risky = ProfileUsesRiskyKeys(imported);
+    const std::wstring summary = DescribeImportedProfile(imported, risky);
+    const UINT flags = static_cast<UINT>(MB_YESNO | MB_DEFBUTTON2 | (risky ? MB_ICONWARNING : MB_ICONQUESTION));
+    m_systemDialogOpen = true;
+    const int answer = MessageBoxW(m_hwnd, summary.c_str(), L"Import profile", flags);
+    m_systemDialogOpen = false;
+    if (answer != IDYES) {
+        ShowToast(L"Import cancelled", false);
+        return;
+    }
+
+    m_profiles->ActivateProfile(m_profiles->AddImportedProfile(std::move(imported)));
+    SyncEngineAndHotkeys();
+    UpdateWindowSizeForLayout();
+    SaveConfigNow();
+    StartAnimTimer();
+    ShowToast(L"Profile imported", false);
 }
 
 } // namespace cadence::ui
