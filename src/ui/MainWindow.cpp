@@ -230,10 +230,14 @@ void MainWindow::RestartAsAdministrator() {
     m_engine.Stop();
 
     SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.lpVerb = L"runas";
-    sei.lpFile = exePath.c_str();
-    sei.nShow  = SW_SHOWNORMAL;
+    sei.cbSize       = sizeof(sei);
+    sei.hwnd         = m_hwnd; // UAC prompt belongs to the Cadence window
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = exePath.c_str();
+    // This instance still holds the single-instance mutex while it shuts down; tell the elevated
+    // instance to wait for it instead of exiting immediately as a duplicate.
+    sei.lpParameters = L"--relaunch";
+    sei.nShow        = SW_SHOWNORMAL;
     if (ShellExecuteExW(&sei)) {
         DestroyWindow(m_hwnd);
     }
