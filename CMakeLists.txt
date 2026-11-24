@@ -9,6 +9,10 @@ if(NOT MSVC)
     message(FATAL_ERROR "Cadence targets Windows 11 with MSVC (C++23).")
 endif()
 
+# Link the MSVC runtime statically: Cadence.exe then needs no vcruntime140.dll / msvcp140.dll,
+# which Windows would otherwise search next to the exe first (e.g. in the Downloads folder).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Common C++23 compiler flags and strict security diagnostics
 add_library(cadence_compile_options INTERFACE)
 target_compile_features(cadence_compile_options INTERFACE cxx_std_23)
@@ -42,6 +46,8 @@ target_link_options(cadence_compile_options INTERFACE
     /NXCOMPAT
     /HIGHENTROPYVA
     /CETCOMPAT
+    # Resolve static imports from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never from the exe folder
+    /DEPENDENTLOADFLAG:0x800
     $<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF;/GUARD:CF;/GUARD:EHCONT>
 )
 
@@ -110,6 +116,17 @@ set_target_properties(Cadence PROPERTIES
     OUTPUT_NAME "Cadence"
     WIN32_EXECUTABLE TRUE
 )
+# DLLs that are not Windows KnownDLLs are loaded on first use, i.e. after wWinMain has called
+# SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32). delayimp ships with MSVC (no third-party code).
+target_link_options(Cadence PRIVATE
+    /DELAYLOAD:d2d1.dll
+    /DELAYLOAD:dwrite.dll
+    /DELAYLOAD:dwmapi.dll
+    /DELAYLOAD:winhttp.dll
+    /DELAYLOAD:bcrypt.dll
+    /DELAYLOAD:avrt.dll
+)
+target_link_libraries(Cadence PRIVATE delayimp)
 
 # ---------------------------------------------------------------------------
 # Timing & Performance Benchmark Executable
